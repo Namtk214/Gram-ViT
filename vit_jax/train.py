@@ -138,42 +138,33 @@ def create_saliency_visualization(image, saliency_map, pred_class_name, true_cla
   return fig
 
 
-def log_histograms(params, grads, prefix, step, sample_rate=0.1):
-  """Log histograms of parameters and gradients to W&B.
-
-  Args:
-    params: Parameter tree
-    grads: Gradient tree
-    prefix: Prefix for metric names
-    step: Current training step
-    sample_rate: Fraction of params to log (to avoid overhead)
-
-  Returns:
-    Dictionary of histogram metrics for W&B
-  """
-  metrics = {}
-
-  # Flatten trees to lists
-  param_flat = jax.tree_util.tree_leaves(params)
-  grad_flat = jax.tree_util.tree_leaves(grads)
-  param_names = [f'layer_{i}' for i in range(len(param_flat))]
-
-  # Sample a subset
-  num_to_log = max(1, int(len(param_flat) * sample_rate))
-  indices = np.linspace(0, len(param_flat) - 1, num_to_log, dtype=int)
-
-  for idx in indices:
-    name = param_names[idx]
-
-    # Log parameter histogram
-    param_array = np.array(param_flat[idx]).flatten()
-    metrics[f'{prefix}/Params/{name}'] = wandb.Histogram(param_array)
-
-    # Log gradient histogram
-    grad_array = np.array(grad_flat[idx]).flatten()
-    metrics[f'{prefix}/Grads/{name}'] = wandb.Histogram(grad_array)
-
-  return metrics
+# DISABLED to save memory - Histogram logging is expensive
+# def log_histograms(params, grads, prefix, step, sample_rate=0.1):
+#   """Log histograms of parameters and gradients to W&B.
+#
+#   Args:
+#     params: Parameter tree
+#     grads: Gradient tree
+#     prefix: Prefix for metric names
+#     step: Current training step
+#     sample_rate: Fraction of params to log (to avoid overhead)
+#
+#   Returns:
+#     Dictionary of histogram metrics for W&B
+#   """
+#   metrics = {}
+#   param_flat = jax.tree_util.tree_leaves(params)
+#   grad_flat = jax.tree_util.tree_leaves(grads)
+#   param_names = [f'layer_{i}' for i in range(len(param_flat))]
+#   num_to_log = max(1, int(len(param_flat) * sample_rate))
+#   indices = np.linspace(0, len(param_flat) - 1, num_to_log, dtype=int)
+#   for idx in indices:
+#     name = param_names[idx]
+#     param_array = np.array(param_flat[idx]).flatten()
+#     metrics[f'{prefix}/Params/{name}'] = wandb.Histogram(param_array)
+#     grad_array = np.array(grad_flat[idx]).flatten()
+#     metrics[f'{prefix}/Grads/{name}'] = wandb.Histogram(grad_array)
+#   return metrics
 
 
 def make_update_fn(*, apply_fn, accum_steps, tx):
@@ -261,11 +252,19 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
   # Log Gram-lowrank configuration
   use_gram_lowrank = config.model.transformer.get('use_gram_lowrank_mhsa', False)
+
+  # Handle string "True"/"False" from command line
+  if isinstance(use_gram_lowrank, str):
+    use_gram_lowrank = use_gram_lowrank.lower() in ('true', '1', 'yes')
+    logging.warning('Config use_gram_lowrank_mhsa received as string, converted to: %s', use_gram_lowrank)
+
   if use_gram_lowrank:
     gram_rank = config.model.transformer.get('gram_lowrank_rank', 8)
     logging.info('✓ Gram-LowRank ENABLED: rank=%d', gram_rank)
   else:
-    logging.info('✗ Gram-LowRank DISABLED')
+    logging.info('✗ Gram-LowRank DISABLED (value was: %s, type: %s)',
+                 config.model.transformer.get('use_gram_lowrank_mhsa', False),
+                 type(config.model.transformer.get('use_gram_lowrank_mhsa', False)))
 
   # Check if we should load pretrained weights
   train_from_scratch = config.get('train_from_scratch', False)
@@ -643,12 +642,12 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
             else:
               logging.warning('✗✗✗ FAILED: No activation metrics collected')
 
-            # Log Saliency Maps (every 500 steps for fixed samples)
-            if step % 500 == 0:
+            # Log Saliency Maps (every 1000 steps for fixed samples to save memory)
+            if step % 1000 == 0:
               try:
                 logging.info('Computing saliency maps...')
                 # Get a few fixed validation samples
-                num_samples = 4
+                num_samples = 2  # Reduced from 4 to save memory
                 sample_images = sample_batch['image'][0][:num_samples]  # [num_samples, H, W, C]
                 sample_labels = sample_batch['label'][0][:num_samples]  # [num_samples, num_classes]
 
@@ -696,39 +695,24 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
           import traceback
           logging.error('Traceback: %s', traceback.format_exc())
 
-      # Log Parameter and Gradient Histograms (every 1000 steps to reduce overhead)
-      if use_wandb and step % 1000 == 0 and step > 0:
-        try:
-          logging.info('Computing parameter and gradient histograms...')
-
-          # Get unreplicated params
-          params_unrepl = flax.jax_utils.unreplicate(params_repl)
-
-          # Compute gradients on a single batch for histogram logging
-          grad_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
-
-          def cross_entropy_loss(*, logits, labels):
-            logp = jax.nn.log_softmax(logits)
-            return -jnp.mean(jnp.sum(logp * labels, axis=1))
-
-          def loss_fn(params):
-            logits = model.apply(
-                {'params': params},
-                grad_batch['image'][0][:8],  # Use first 8 samples from first device
-                train=False)
-            return cross_entropy_loss(logits=logits, labels=grad_batch['label'][0][:8])
-
-          grads = jax.grad(loss_fn)(params_unrepl)
-
-          # Log histograms (sample 10% of layers)
-          hist_metrics = log_histograms(params_unrepl, grads, 'Histograms', step, sample_rate=0.1)
-          wandb.log(hist_metrics, step=step)
-          logging.info('✓ Logged %d parameter/gradient histograms', len(hist_metrics))
-
-        except Exception as e:
-          logging.warning('Failed to log param/grad histograms: %s', str(e))
-          import traceback
-          logging.warning('Traceback: %s', traceback.format_exc())
+      # Log Parameter and Gradient Histograms - DISABLED to save memory
+      # if use_wandb and step % 1000 == 0 and step > 0:
+      #   try:
+      #     logging.info('Computing parameter and gradient histograms...')
+      #     params_unrepl = flax.jax_utils.unreplicate(params_repl)
+      #     grad_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
+      #     def cross_entropy_loss(*, logits, labels):
+      #       logp = jax.nn.log_softmax(logits)
+      #       return -jnp.mean(jnp.sum(logp * labels, axis=1))
+      #     def loss_fn(params):
+      #       logits = model.apply({'params': params}, grad_batch['image'][0][:8], train=False)
+      #       return cross_entropy_loss(logits=logits, labels=grad_batch['label'][0][:8])
+      #     grads = jax.grad(loss_fn)(params_unrepl)
+      #     hist_metrics = log_histograms(params_unrepl, grads, 'Histograms', step, sample_rate=0.1)
+      #     wandb.log(hist_metrics, step=step)
+      #     logging.info('✓ Logged %d parameter/gradient histograms', len(hist_metrics))
+      #   except Exception as e:
+      #     logging.warning('Failed to log param/grad histograms: %s', str(e))
 
     # Store checkpoint.
     if ((config.checkpoint_every and step % config.eval_every == 0) or
