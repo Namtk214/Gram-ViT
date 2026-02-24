@@ -188,14 +188,18 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
           rngs=dict(dropout=dropout_rng),
           inputs=images,
           train=True)
-      return cross_entropy_loss(logits=logits, labels=labels), logits
+      return cross_entropy_loss(logits=logits, labels=labels)
 
-    (l, logits), g = utils.accumulate_gradient(
-        jax.value_and_grad(loss_fn, has_aux=True), params, batch['image'], batch['label'],
+    l, g = utils.accumulate_gradient(
+        jax.value_and_grad(loss_fn), params, batch['image'], batch['label'],
         accum_steps)
     g = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='batch'), g)
 
-    # Compute accuracy
+    # Compute accuracy with a separate forward pass (without dropout for consistent accuracy)
+    logits = apply_fn(
+        dict(params=params),
+        inputs=batch['image'],
+        train=False)
     preds = jnp.argmax(logits, axis=-1)
     labels_idx = jnp.argmax(batch['label'], axis=-1)
     correct = jnp.equal(preds, labels_idx)
