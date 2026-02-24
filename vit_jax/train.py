@@ -198,12 +198,71 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
     # Compute gradient norm before updates
     grad_norm = tree_norm(g)
 
+    # Compute gradient metrics for important layers
+    grad_metrics = {}
+
+    # Extract gradient norms for Transformer layers
+    if 'Transformer' in g:
+      transformer_grads = g['Transformer']
+
+      # Log gradient norms for each encoder block
+      for key in transformer_grads:
+        if key.startswith('encoderblock_'):
+          block_idx = key.split('_')[1]
+          block_grads = transformer_grads[key]
+
+          # Overall block gradient norm
+          block_grad_norm = tree_norm(block_grads)
+          grad_metrics[f'block_{block_idx}_grad_norm'] = block_grad_norm
+
+          # MultiHeadDotProductAttention gradients
+          if 'MultiHeadDotProductAttention_0' in block_grads:
+            mhsa_grad_norm = tree_norm(block_grads['MultiHeadDotProductAttention_0'])
+            grad_metrics[f'block_{block_idx}_mhsa_grad_norm'] = mhsa_grad_norm
+
+          # MLP gradients
+          if 'MlpBlock_0' in block_grads:
+            mlp_grad_norm = tree_norm(block_grads['MlpBlock_0'])
+            grad_metrics[f'block_{block_idx}_mlp_grad_norm'] = mlp_grad_norm
+
+          # GramLowRankMHSAResidual gradients (A and B matrices)
+          if 'GramLowRankMHSAResidual_0' in block_grads:
+            gram_grads = block_grads['GramLowRankMHSAResidual_0']
+
+            # Total Gram-lowrank gradient norm
+            gram_grad_norm = tree_norm(gram_grads)
+            grad_metrics[f'block_{block_idx}_gram_grad_norm'] = gram_grad_norm
+
+            # A matrix gradient norm
+            if 'A' in gram_grads:
+              a_grad_norm = jnp.linalg.norm(gram_grads['A'])
+              grad_metrics[f'block_{block_idx}_gram_A_grad_norm'] = a_grad_norm
+
+            # B matrix gradient norm
+            if 'B' in gram_grads:
+              b_grad_norm = jnp.linalg.norm(gram_grads['B'])
+              grad_metrics[f'block_{block_idx}_gram_B_grad_norm'] = b_grad_norm
+
+            # X_scale gradient norm
+            if 'X_scale' in gram_grads:
+              x_scale_grad_norm = jnp.linalg.norm(gram_grads['X_scale'])
+              grad_metrics[f'block_{block_idx}_gram_X_scale_grad_norm'] = x_scale_grad_norm
+
+            # T_scale gradient norm
+            if 'T_scale' in gram_grads:
+              t_scale_grad_norm = jnp.linalg.norm(gram_grads['T_scale'])
+              grad_metrics[f'block_{block_idx}_gram_T_scale_grad_norm'] = t_scale_grad_norm
+
+    # Pmean all gradient metrics across devices
+    grad_metrics = jax.tree.map(
+        lambda x: jax.lax.pmean(x, axis_name='batch'), grad_metrics)
+
     updates, opt_state = tx.update(g, opt_state)
     params = optax.apply_updates(params, updates)
     l = jax.lax.pmean(l, axis_name='batch')
     grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
 
-    return params, opt_state, l, new_rng, grad_norm
+    return params, opt_state, l, new_rng, grad_norm, grad_metrics
 
   return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0,))
 
@@ -368,8 +427,12 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       range(initial_step, total_steps + 1),
       input_pipeline.prefetch(ds_train, config.prefetch)):
 
+    # Debug: Print input image statistics
+    imgs = batch['image']
+    print(f"[Step {step}] Input image - Shape: {imgs.shape}, Min: {float(jnp.min(imgs)):.4f}, Max: {float(jnp.max(imgs)):.4f}, Mean: {float(jnp.mean(imgs)):.4f}, Std: {float(jnp.std(imgs)):.4f}")
+
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
-      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl = update_fn_repl(
+      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl, grad_metrics_repl = update_fn_repl(
           params_repl, opt_state_repl, batch, update_rng_repl)
 
     for hook in hooks:
@@ -397,13 +460,43 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
       # W&B logging - train metrics
       if use_wandb:
-        wandb.log({
+        wandb_train_metrics = {
             'Train/loss': train_loss,
             'Train/learning_rate': current_lr,
             'Optim/lr': current_lr,
             'System/img_sec_core_train': img_sec_core_train,
             'step': step
-        }, step=step)
+        }
+
+        # Add gradient metrics
+        grad_metrics_unrepl = flax.jax_utils.unreplicate(grad_metrics_repl)
+        for key, value in grad_metrics_unrepl.items():
+          # Parse key to get block and metric name
+          if key.startswith('block_'):
+            parts = key.split('_', 2)  # ['block', 'idx', 'rest']
+            if len(parts) >= 3:
+              block_idx = parts[1]
+              metric_name = '_'.join(parts[2:])
+
+              # Map metric names to W&B keys
+              if metric_name == 'grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/total'] = float(value)
+              elif metric_name == 'mhsa_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/mhsa'] = float(value)
+              elif metric_name == 'mlp_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/mlp'] = float(value)
+              elif metric_name == 'gram_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/gram_total'] = float(value)
+              elif metric_name == 'gram_A_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/gram_A'] = float(value)
+              elif metric_name == 'gram_B_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/gram_B'] = float(value)
+              elif metric_name == 'gram_X_scale_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/gram_X_scale'] = float(value)
+              elif metric_name == 'gram_T_scale_grad_norm':
+                wandb_train_metrics[f'Gradients/block_{block_idx}/gram_T_scale'] = float(value)
+
+        wandb.log(wandb_train_metrics, step=step)
 
       done = step / total_steps
       logging.info(f'Step: {step}/{total_steps} {100*done:.1f}%, '  # pylint: disable=logging-fstring-interpolation
