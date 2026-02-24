@@ -410,7 +410,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
           # Run forward pass with mutable intermediates collection
           _, state = model.apply(
               {'params': flax.jax_utils.unreplicate(params_repl)},
-              sample_batch['image'][0:1],  # Single device, single sample
+              sample_batch['image'][0][:1],  # Single device, single sample
               train=False,
               mutable=['intermediates']
           )
