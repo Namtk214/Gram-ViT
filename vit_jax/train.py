@@ -417,58 +417,91 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
           # Extract intermediates if available
           if 'intermediates' in state:
-            logging.info('Intermediates found in state')
+            logging.info('✓ Intermediates found in state')
             intermediates = state['intermediates']
+            logging.info('Intermediates keys: %s', list(intermediates.keys()))
             activation_metrics = {}
-          else:
-            logging.warning('No intermediates found in state. Available keys: %s', state.keys())
 
             # Log activation and Gram-lowrank stats per block
             # Traverse the intermediates tree to find encoder blocks
             if 'Transformer' in intermediates:
               transformer_intermediates = intermediates['Transformer']
+              logging.info('✓ Found Transformer in intermediates with %d keys', len(transformer_intermediates))
+              logging.info('Transformer keys: %s', list(transformer_intermediates.keys()))
+
+              encoder_block_count = 0
               for block_name, block_intermediates in transformer_intermediates.items():
                 if 'encoderblock_' in block_name:
+                  encoder_block_count += 1
                   block_idx = block_name.split('_')[-1]
+                  logging.info('Processing block %s, available keys: %s', block_name, list(block_intermediates.keys()))
 
                   # Log MHSA and MLP activation stats
+                  activation_found = 0
                   if 'mhsa_out_mean' in block_intermediates:
                     activation_metrics[f'Activations/block_{block_idx}/mhsa_out_mean'] = float(
                         block_intermediates['mhsa_out_mean'][0])
+                    activation_found += 1
                   if 'mhsa_out_std' in block_intermediates:
                     activation_metrics[f'Activations/block_{block_idx}/mhsa_out_std'] = float(
                         block_intermediates['mhsa_out_std'][0])
+                    activation_found += 1
                   if 'mlp_out_mean' in block_intermediates:
                     activation_metrics[f'Activations/block_{block_idx}/mlp_out_mean'] = float(
                         block_intermediates['mlp_out_mean'][0])
+                    activation_found += 1
                   if 'mlp_out_std' in block_intermediates:
                     activation_metrics[f'Activations/block_{block_idx}/mlp_out_std'] = float(
                         block_intermediates['mlp_out_std'][0])
+                    activation_found += 1
+
+                  if activation_found > 0:
+                    logging.info('  ✓ Collected %d activation metrics for block_%s', activation_found, block_idx)
 
                   # Log Gram-lowrank metrics if available
                   if 'GramLowRankMHSAResidual_0' in block_intermediates:
                     gram_intermediates = block_intermediates['GramLowRankMHSAResidual_0']
+                    logging.info('  ✓ Found GramLowRankMHSAResidual_0, keys: %s', list(gram_intermediates.keys()))
+                    gram_found = 0
                     if 'T_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
                           gram_intermediates['T_norm'][0])
+                      gram_found += 1
                     if 'Z_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/Z_norm'] = float(
                           gram_intermediates['Z_norm'][0])
+                      gram_found += 1
                     if 'T_over_Z_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/T_over_Z_norm'] = float(
                           gram_intermediates['T_over_Z_norm'][0])
+                      gram_found += 1
                     if 'A_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/A_norm'] = float(
                           gram_intermediates['A_norm'][0])
+                      gram_found += 1
                     if 'B_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
                           gram_intermediates['B_norm'][0])
+                      gram_found += 1
+
+                    if gram_found > 0:
+                      logging.info('  ✓ Collected %d Gram-lowrank metrics for block_%s', gram_found, block_idx)
+                  else:
+                    logging.warning('  ✗ No GramLowRankMHSAResidual_0 found in block_%s', block_idx)
+
+              logging.info('✓ Processed %d encoder blocks', encoder_block_count)
+            else:
+              logging.warning('✗ No Transformer found in intermediates')
 
             if activation_metrics:
-              logging.info('Logging %d activation/gram metrics to W&B', len(activation_metrics))
+              logging.info('✓✓✓ SUCCESS: Logging %d activation/gram metrics to W&B', len(activation_metrics))
+              logging.info('Metrics being logged: %s', list(activation_metrics.keys()))
               wandb.log(activation_metrics, step=step)
+              logging.info('✓✓✓ Metrics successfully sent to W&B')
             else:
-              logging.warning('No activation metrics collected')
+              logging.warning('✗✗✗ FAILED: No activation metrics collected')
+          else:
+            logging.warning('✗ No intermediates found in state. Available keys: %s', state.keys())
 
         except Exception as e:
           logging.error('Failed to capture intermediates for logging: %s', str(e))
