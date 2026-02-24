@@ -595,6 +595,14 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                       activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
                           gram_intermediates['B_norm'][0])
                       gram_found += 1
+                    if 'A_normed_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/A_normed_norm'] = float(
+                          gram_intermediates['A_normed_norm'][0])
+                      gram_found += 1
+                    if 'B_normed_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/B_normed_norm'] = float(
+                          gram_intermediates['B_normed_norm'][0])
+                      gram_found += 1
 
                     if gram_found > 0:
                       logging.info('  ✓ Collected %d Gram-lowrank metrics for block_%s', gram_found, block_idx)
@@ -647,7 +655,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               try:
                 logging.info('Computing saliency maps...')
                 # Get a few fixed validation samples
-                num_samples = 2  # Reduced from 4 to save memory
+                num_samples = 4  # Reduced from 4 to save memory
                 sample_images = sample_batch['image'][0][:num_samples]  # [num_samples, H, W, C]
                 sample_labels = sample_batch['label'][0][:num_samples]  # [num_samples, num_classes]
 
