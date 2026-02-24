@@ -281,7 +281,7 @@ class Encoder(nn.Module):
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
   add_position_embedding: bool = True
-  use_gram_lowrank_mhsa: bool = False
+  use_gram_lowrank_mhsa: bool = True
   gram_lowrank_rank: int = 8
   gram_lowrank_a_init_std: float = 1e-2
 
@@ -311,6 +311,9 @@ class Encoder(nn.Module):
           mlp_dim=self.mlp_dim,
           dropout_rate=self.dropout_rate,
           attention_dropout_rate=self.attention_dropout_rate,
+          use_gram_lowrank_mhsa=self.use_gram_lowrank_mhsa,
+          gram_lowrank_rank=self.gram_lowrank_rank,
+          gram_lowrank_a_init_std=self.gram_lowrank_a_init_std,
           name=f'encoderblock_{lyr}',
           num_heads=self.num_heads)(
               x, deterministic=not train)
