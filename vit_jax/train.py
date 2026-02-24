@@ -395,8 +395,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
       train_loss = float(flax.jax_utils.unreplicate(loss_repl))
       train_accuracy = float(flax.jax_utils.unreplicate(train_accuracy_repl))
-      grad_norm = float(flax.jax_utils.unreplicate(grad_norm_repl))
-      param_norm = float(tree_norm(flax.jax_utils.unreplicate(params_repl)))
       current_lr = float(lr_fn(step))
 
       writer.write_scalars(
@@ -406,15 +404,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               train_accuracy=train_accuracy,
               img_sec_core_train=img_sec_core_train))
 
-      # W&B logging - Priority 1 & 2 train metrics
+      # W&B logging - train metrics
       if use_wandb:
         wandb.log({
             'Train/loss': train_loss,
             'Train/accuracy': train_accuracy,
             'Train/learning_rate': current_lr,
             'Optim/lr': current_lr,
-            'Optim/grad_global_norm': grad_norm,
-            'Optim/param_global_norm': param_norm,
             'System/img_sec_core_train': img_sec_core_train,
             'step': step
         }, step=step)
@@ -539,98 +535,37 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
             logging.info('Intermediates keys: %s', list(intermediates.keys()))
             activation_metrics = {}
 
-            # Log activation and Gram-lowrank stats per block
+            # Log block output statistics per block
             # Traverse the intermediates tree to find encoder blocks
             if 'Transformer' in intermediates:
               transformer_intermediates = intermediates['Transformer']
               logging.info('✓ Found Transformer in intermediates with %d keys', len(transformer_intermediates))
-              logging.info('Transformer keys: %s', list(transformer_intermediates.keys()))
 
               encoder_block_count = 0
               for block_name, block_intermediates in transformer_intermediates.items():
                 if 'encoderblock_' in block_name:
                   encoder_block_count += 1
                   block_idx = block_name.split('_')[-1]
-                  logging.info('Processing block %s, available keys: %s', block_name, list(block_intermediates.keys()))
 
-                  # Log MHSA and MLP activation stats
-                  activation_found = 0
-                  if 'mhsa_out_mean' in block_intermediates:
-                    activation_metrics[f'Activations/block_{block_idx}/mhsa_out_mean'] = float(
-                        block_intermediates['mhsa_out_mean'][0])
-                    activation_found += 1
-                  if 'mhsa_out_std' in block_intermediates:
-                    activation_metrics[f'Activations/block_{block_idx}/mhsa_out_std'] = float(
-                        block_intermediates['mhsa_out_std'][0])
-                    activation_found += 1
-                  if 'mlp_out_mean' in block_intermediates:
-                    activation_metrics[f'Activations/block_{block_idx}/mlp_out_mean'] = float(
-                        block_intermediates['mlp_out_mean'][0])
-                    activation_found += 1
-                  if 'mlp_out_std' in block_intermediates:
-                    activation_metrics[f'Activations/block_{block_idx}/mlp_out_std'] = float(
-                        block_intermediates['mlp_out_std'][0])
-                    activation_found += 1
+                  # Log block output statistics (mean, abs_mean, std across all tokens and dims)
+                  stats_found = 0
+                  if 'block_output_mean' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/output_mean'] = float(
+                        block_intermediates['block_output_mean'][0])
+                    stats_found += 1
+                  if 'block_output_abs_mean' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/output_abs_mean'] = float(
+                        block_intermediates['block_output_abs_mean'][0])
+                    stats_found += 1
+                  if 'block_output_std' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/output_std'] = float(
+                        block_intermediates['block_output_std'][0])
+                    stats_found += 1
 
-                  if activation_found > 0:
-                    logging.info('  ✓ Collected %d activation metrics for block_%s', activation_found, block_idx)
-
-                  # Log Gram-lowrank metrics if available
-                  # Find GramLowRank module (name might vary, so search for it)
-                  gram_key = None
-                  for key in block_intermediates.keys():
-                    if 'GramLowRank' in key:
-                      gram_key = key
-                      break
-
-                  if gram_key is not None:
-                    gram_intermediates = block_intermediates[gram_key]
-                    logging.info('  ✓ Found %s, keys: %s', gram_key, list(gram_intermediates.keys()))
-                    gram_found = 0
-                    if 'T_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
-                          gram_intermediates['T_norm'][0])
-                      gram_found += 1
-                    if 'Z_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/Z_norm'] = float(
-                          gram_intermediates['Z_norm'][0])
-                      gram_found += 1
-                    if 'T_over_Z_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/T_over_Z_norm'] = float(
-                          gram_intermediates['T_over_Z_norm'][0])
-                      gram_found += 1
-                    if 'A_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/A_norm'] = float(
-                          gram_intermediates['A_norm'][0])
-                      gram_found += 1
-                    if 'B_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
-                          gram_intermediates['B_norm'][0])
-                      gram_found += 1
-                    if 'T_normed_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/T_normed_norm'] = float(
-                          gram_intermediates['T_normed_norm'][0])
-                      gram_found += 1
-                    if 'X_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/X_norm'] = float(
-                          gram_intermediates['X_norm'][0])
-                      gram_found += 1
-                    if 'X_normed_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/X_normed_norm'] = float(
-                          gram_intermediates['X_normed_norm'][0])
-                      gram_found += 1
-
-                    if gram_found > 0:
-                      logging.info('  ✓ Collected %d Gram-lowrank metrics for block_%s', gram_found, block_idx)
-                    else:
-                      logging.warning('  ✗ GramLowRank module found but no metrics collected for block_%s', block_idx)
+                  if stats_found > 0:
+                    logging.info('  ✓ Collected %d block output stats for block_%s', stats_found, block_idx)
                   else:
-                    # Only log warning if Gram-lowrank is enabled in config
-                    if use_gram_lowrank:
-                      logging.warning('  ✗ No GramLowRank module found in block_%s (available keys: %s)',
-                                    block_idx, list(block_intermediates.keys()))
-                    else:
-                      logging.debug('  GramLowRank disabled in config, skipping for block_%s', block_idx)
+                    logging.warning('  ✗ No block output stats found for block_%s', block_idx)
 
               logging.info('✓ Processed %d encoder blocks', encoder_block_count)
             else:
@@ -641,28 +576,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               logging.info('Metrics being logged: %s', list(activation_metrics.keys()))
               wandb.log(activation_metrics, step=step)
               logging.info('✓✓✓ Metrics successfully sent to W&B')
-
-              # Log activation histograms (every 500 steps to reduce overhead)
-              if step % 500 == 0:
-                try:
-                  logging.info('Logging activation histograms...')
-                  hist_metrics = {}
-                  if 'Transformer' in intermediates:
-                    transformer_intermediates = intermediates['Transformer']
-                    for block_name, block_intermediates in transformer_intermediates.items():
-                      if 'encoderblock_' in block_name:
-                        block_idx = block_name.split('_')[-1]
-
-                        # MHSA output histogram (first block only to reduce overhead)
-                        if block_idx == '0' and 'mhsa_out_mean' in block_intermediates:
-                          # Get full MHSA output from the forward pass
-                          pass  # We only have mean/std, not full tensor
-
-                  # For now, skip activation histograms since we only sow mean/std
-                  # logging.info('Activation histograms: skipped (only mean/std available)')
-                except Exception as e:
-                  logging.warning('Failed to log activation histograms: %s', str(e))
-
             else:
               logging.warning('✗✗✗ FAILED: No activation metrics collected')
 

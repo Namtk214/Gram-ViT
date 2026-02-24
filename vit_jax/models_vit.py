@@ -255,10 +255,6 @@ class Encoder1DBlock(nn.Module):
           param_dtype=self.dtype)(
               x_mhsa_in, z_mhsa_out)
 
-    # Sow MHSA activation stats
-    self.sow('intermediates', 'mhsa_out_mean', jnp.mean(z_mhsa_out))
-    self.sow('intermediates', 'mhsa_out_std', jnp.std(z_mhsa_out))
-
     x = nn.Dropout(rate=self.dropout_rate)(z_mhsa_out, deterministic=deterministic)
     x = x + inputs
 
@@ -268,11 +264,15 @@ class Encoder1DBlock(nn.Module):
         mlp_dim=self.mlp_dim, dtype=self.dtype, dropout_rate=self.dropout_rate)(
             y, deterministic=deterministic)
 
-    # Sow MLP activation stats
-    self.sow('intermediates', 'mlp_out_mean', jnp.mean(y))
-    self.sow('intermediates', 'mlp_out_std', jnp.std(y))
+    # Compute block output
+    block_output = x + y
 
-    return x + y
+    # Sow block output statistics (mean, abs_mean, std across all tokens and dimensions)
+    self.sow('intermediates', 'block_output_mean', jnp.mean(block_output))
+    self.sow('intermediates', 'block_output_abs_mean', jnp.mean(jnp.abs(block_output)))
+    self.sow('intermediates', 'block_output_std', jnp.std(block_output))
+
+    return block_output
 
 
 class Encoder(nn.Module):
