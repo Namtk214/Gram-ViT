@@ -102,6 +102,83 @@ class MlpBlock(nn.Module):
     return output
 
 
+class GramLowRankMHSAResidual(nn.Module):
+  """Gram + Low-Rank residual correction for MHSA output.
+
+  Adds a correction term to MHSA output based on token Gram matrix and
+  low-rank matrices A and B:
+    Y = Z + T, where T = G_t(AB)
+    G_t = XX^T / D (token Gram matrix)
+
+  Attributes:
+    rank: Rank for low-rank matrices A and B.
+    a_init_std: Standard deviation for initializing matrix A.
+    param_dtype: Data type for parameters.
+  """
+
+  rank: int = 8
+  a_init_std: float = 1e-2
+  param_dtype: Dtype = jnp.float32
+
+  @nn.compact
+  def __call__(self, x_mhsa_in, z_mhsa_out):
+    """Apply Gram + Low-Rank residual correction.
+
+    Args:
+      x_mhsa_in: Input to MHSA (after LayerNorm), shape [B, N, D].
+      z_mhsa_out: Output from MHSA, shape [B, N, D].
+
+    Returns:
+      Y = Z + T, where T is the correction term, shape [B, N, D].
+    """
+    # Get shapes
+    batch_size, num_tokens, hidden_dim = x_mhsa_in.shape
+
+    # Step 1: Compute token Gram matrix G_t = XX^T / D
+    # Shape: [B, N, N]
+    gram_matrix = jnp.matmul(x_mhsa_in, jnp.transpose(x_mhsa_in, (0, 2, 1))) / hidden_dim
+
+    # Step 2: Define low-rank parameters A and B
+    # A: [N, r], initialized with small random values (LoRA-style)
+    # B: [r, D], initialized with zeros (makes branch no-op initially)
+    a_matrix = self.param(
+        'A',
+        nn.initializers.normal(stddev=self.a_init_std),
+        (num_tokens, self.rank),
+        self.param_dtype
+    )
+
+    b_matrix = self.param(
+        'B',
+        nn.initializers.zeros,
+        (self.rank, hidden_dim),
+        self.param_dtype
+    )
+
+    # Step 3: Compute P = AB, shape [N, D]
+    p_matrix = jnp.matmul(a_matrix, b_matrix)
+
+    # Step 4: Compute correction term T = G_t @ P, shape [B, N, D]
+    correction_term = jnp.matmul(gram_matrix, p_matrix)
+
+    # Compute metrics for W&B logging
+    t_norm = jnp.linalg.norm(correction_term)
+    z_norm = jnp.linalg.norm(z_mhsa_out)
+    t_over_z_norm = t_norm / (z_norm + 1e-8)  # avoid division by zero
+    a_norm = jnp.linalg.norm(a_matrix)
+    b_norm = jnp.linalg.norm(b_matrix)
+
+    # Sow metrics for logging (stored in 'intermediates' collection)
+    self.sow('intermediates', 'T_norm', t_norm)
+    self.sow('intermediates', 'Z_norm', z_norm)
+    self.sow('intermediates', 'T_over_Z_norm', t_over_z_norm)
+    self.sow('intermediates', 'A_norm', a_norm)
+    self.sow('intermediates', 'B_norm', b_norm)
+
+    # Step 5: Add correction to MHSA output
+    return z_mhsa_out + correction_term
+
+
 class Encoder1DBlock(nn.Module):
   """Transformer encoder layer.
 
@@ -113,6 +190,9 @@ class Encoder1DBlock(nn.Module):
     attention_dropout_rate: dropout for attention heads.
     deterministic: bool, deterministic or not (to apply dropout).
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA.
+    gram_lowrank_rank: Rank for low-rank matrices in Gram residual.
+    gram_lowrank_a_init_std: Std dev for initializing A matrix in Gram residual.
   """
 
   mlp_dim: int
@@ -120,6 +200,10 @@ class Encoder1DBlock(nn.Module):
   dtype: Dtype = jnp.float32
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
+  # bool = true
+  use_gram_lowrank_mhsa: bool = False 
+  gram_lowrank_rank: int = 8
+  gram_lowrank_a_init_std: float = 1e-2
 
   @nn.compact
   def __call__(self, inputs, *, deterministic):
@@ -135,16 +219,33 @@ class Encoder1DBlock(nn.Module):
 
     # Attention block.
     assert inputs.ndim == 3, f'Expected (batch, seq, hidden) got {inputs.shape}'
-    x = nn.LayerNorm(dtype=self.dtype)(inputs)
-    x = nn.MultiHeadDotProductAttention(
+
+    # LayerNorm before MHSA
+    x_mhsa_in = nn.LayerNorm(dtype=self.dtype)(inputs)
+
+    # MHSA output
+    z_mhsa_out = nn.MultiHeadDotProductAttention(
         dtype=self.dtype,
         kernel_init=nn.initializers.xavier_uniform(),
         broadcast_dropout=False,
         deterministic=deterministic,
         dropout_rate=self.attention_dropout_rate,
         num_heads=self.num_heads)(
-            x, x)
-    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+            x_mhsa_in, x_mhsa_in)
+
+    # Apply Gram + Low-Rank residual if enabled
+    if self.use_gram_lowrank_mhsa:
+      z_mhsa_out = GramLowRankMHSAResidual(
+          rank=self.gram_lowrank_rank,
+          a_init_std=self.gram_lowrank_a_init_std,
+          param_dtype=self.dtype)(
+              x_mhsa_in, z_mhsa_out)
+
+    # Sow MHSA activation stats
+    self.sow('intermediates', 'mhsa_out_mean', jnp.mean(z_mhsa_out))
+    self.sow('intermediates', 'mhsa_out_std', jnp.std(z_mhsa_out))
+
+    x = nn.Dropout(rate=self.dropout_rate)(z_mhsa_out, deterministic=deterministic)
     x = x + inputs
 
     # MLP block.
@@ -152,6 +253,10 @@ class Encoder1DBlock(nn.Module):
     y = MlpBlock(
         mlp_dim=self.mlp_dim, dtype=self.dtype, dropout_rate=self.dropout_rate)(
             y, deterministic=deterministic)
+
+    # Sow MLP activation stats
+    self.sow('intermediates', 'mlp_out_mean', jnp.mean(y))
+    self.sow('intermediates', 'mlp_out_std', jnp.std(y))
 
     return x + y
 
@@ -165,6 +270,9 @@ class Encoder(nn.Module):
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
     dropout_rate: dropout rate.
     attention_dropout_rate: dropout rate in self attention.
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA.
+    gram_lowrank_rank: Rank for low-rank matrices in Gram residual.
+    gram_lowrank_a_init_std: Std dev for initializing A matrix in Gram residual.
   """
 
   num_layers: int
@@ -173,6 +281,9 @@ class Encoder(nn.Module):
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
   add_position_embedding: bool = True
+  use_gram_lowrank_mhsa: bool = False
+  gram_lowrank_rank: int = 8
+  gram_lowrank_a_init_std: float = 1e-2
 
   @nn.compact
   def __call__(self, x, *, train):

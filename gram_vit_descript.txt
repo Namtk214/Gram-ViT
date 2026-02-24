@@ -1,0 +1,146 @@
+# Gram + Low-Rank Residual on MHSA Output (Z) for ViT (Flax/JAX)
+
+
+## Prepraring:
+trước tiên bạn hãy cd vào folder vit_jax, đọc các file liên quan đến ViT trong đó 
+để hiểu bối cảnh tốt hơn
+
+## Mục tiêu
+
+Thêm một nhánh residual mới vào **attention branch** của `Encoder1DBlock` trong ViT:
+
+- Gọi:
+  - `X`: đầu vào của MHSA (sau LayerNorm)
+  - `Z = MHSA(X)`: đầu ra của MHSA
+- Thêm một correction term dựa trên **token Gram matrix** và **low-rank matrices A, B**
+- Cộng trực tiếp vào `Z`:
+
+\[
+Y = Z + T,\quad T = G_t (AB)
+\]
+
+với:
+
+\[
+G_t = \frac{XX^\top}{D}
+\]
+
+---
+
+## Công thức và shape (phiên bản dùng để implement)
+
+Giả sử:
+- `X` có shape `[B, N, D]` (batch, tokens, hidden_dim)
+- `Z = MHSA(X)` có shape `[B, N, D]`
+
+### Bước 1 — Token Gram
+\[
+G_t = \frac{XX^\top}{D}
+\]
+- Shape: `[B, N, N]`
+
+### Bước 2 — Low-rank parameters
+Chọn:
+- `A` shape `[N, r]`
+- `B` shape `[r, D]`
+
+Khi đó:
+\[
+P = AB
+\]
+- Shape: `[N, D]`
+
+### Bước 3 — Correction term
+\[
+T = G_t P
+\]
+- Shape: `[B, N, D]`
+
+### Bước 4 — Cộng với MHSA output
+\[
+Y = Z + T
+\]
+- Shape: `[B, N, D]`
+
+✅ Không cần broadcast  
+✅ Shape khớp trực tiếp với `Z`
+
+---
+
+## Nguyên tắc khởi tạo A, B (để branch mới là no-op lúc đầu)
+
+Khởi tạo theo kiểu LoRA-style:
+
+- `A`: random nhỏ
+- `B`: zeros
+
+Ví dụ:
+- `A ~ Normal(0, 0.01)`
+- `B = 0`
+
+Khi đó:
+\[
+AB = 0 \Rightarrow T = G_t(AB)=0 \Rightarrow Y = Z
+\]
+
+=> Branch mới ban đầu **không làm thay đổi model**, giúp train ổn định.
+
+---
+
+## Các thay đổi cần làm trong code hiện tại
+
+## 1 Thêm module mới: `GramLowRankMHSAResidual`
+
+### Vị trí
+Thêm vào file model (cùng nơi có `MlpBlock`, `Encoder1DBlock`, ...), ví dụ ngay trước `Encoder1DBlock`.
+
+### Chức năng
+Module này nhận:
+- `x_mhsa_in` = đầu vào của MHSA (sau LayerNorm), shape `[B,N,D]`
+- `z_mhsa_out` = đầu ra MHSA, shape `[B,N,D]`
+
+và trả về:
+- `y = z_mhsa_out + G_t(AB)` shape `[B,N,D]`
+
+### Lưu ý:
+## 1 Thêm config cho feature mới (khuyên dùng)
+
+Hiện Encoder1DBlock chưa có tham số cho rank/toggle. Nên thêm các tham số sau:
+
+Trong Encoder1DBlock
+
+use_gram_lowrank_mhsa: bool = False
+
+gram_lowrank_rank: int = 8
+
+gram_lowrank_a_init_std: float = 1e-2
+
+Trong Encoder
+
+Truyền các tham số này xuống từng block:
+
+use_gram_lowrank_mhsa
+
+gram_lowrank_rank
+
+gram_lowrank_a_init_std
+
+Trong config model (config.model.transformer)
+
+Thêm ví dụ:
+
+transformer=dict(
+    num_layers=...,
+    mlp_dim=...,
+    num_heads=...,
+    dropout_rate=...,
+    attention_dropout_rate=...,
+    use_gram_lowrank_mhsa=True,
+    gram_lowrank_rank=8,
+    gram_lowrank_a_init_std=1e-2,
+)
+
+## 2 pretrained checkpoint loading: MẶC KỆ PHẦN PRE TRAIN check point, chúng ta đang train ViT from scratch cho bài
+toán CiFAR 10 classifier nên ko cần checkpoint pretrain model
+
+## bạn ko cần chạy code vì code đây yêu cầu TPU

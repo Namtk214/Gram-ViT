@@ -27,11 +27,47 @@ import ml_collections
 import numpy as np
 import optax
 import tensorflow as tf
+import wandb
 
 from vit_jax import checkpoint
 from vit_jax import input_pipeline
 from vit_jax import models
 from vit_jax import utils
+
+
+def compute_confusion_matrix(y_true, y_pred, num_classes=10):
+  """Compute confusion matrix from true and predicted labels."""
+  conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int32)
+  for t, p in zip(y_true, y_pred):
+    conf_matrix[t, p] += 1
+  return conf_matrix
+
+
+def compute_per_class_accuracy(y_true, y_pred, num_classes=10):
+  """Compute per-class accuracy."""
+  per_class_acc = {}
+  class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                 'dog', 'frog', 'horse', 'ship', 'truck']
+  for i in range(num_classes):
+    mask = y_true == i
+    if mask.sum() > 0:
+      per_class_acc[class_names[i]] = (y_pred[mask] == i).sum() / mask.sum()
+    else:
+      per_class_acc[class_names[i]] = 0.0
+  return per_class_acc
+
+
+def compute_topk_accuracy(logits, labels, k=5):
+  """Compute top-k accuracy."""
+  top_k_preds = np.argsort(logits, axis=-1)[:, -k:]
+  true_labels = np.argmax(labels, axis=-1)
+  correct = np.array([label in preds for label, preds in zip(true_labels, top_k_preds)])
+  return correct.mean()
+
+
+def tree_norm(tree):
+  """Compute global norm of a pytree."""
+  return jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(tree)))
 
 
 def make_update_fn(*, apply_fn, accum_steps, tx):
@@ -61,17 +97,30 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
         jax.value_and_grad(loss_fn), params, batch['image'], batch['label'],
         accum_steps)
     g = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='batch'), g)
+
+    # Compute gradient norm before updates
+    grad_norm = tree_norm(g)
+
     updates, opt_state = tx.update(g, opt_state)
     params = optax.apply_updates(params, updates)
     l = jax.lax.pmean(l, axis_name='batch')
+    grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
 
-    return params, opt_state, l, new_rng
+    return params, opt_state, l, new_rng, grad_norm
 
   return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0,))
 
 
 def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   """Runs training interleaved with evaluation."""
+
+  # Initialize Weights & Biases
+  wandb.init(
+      project="gram-vit-cifar10",
+      name=f"{config.model.model_name}_{config.dataset}",
+      config=config.to_dict(),
+      dir=workdir
+  )
 
   # Setup input pipeline
   dataset_info = input_pipeline.get_dataset_info(config.dataset, 'train')
@@ -181,7 +230,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       input_pipeline.prefetch(ds_train, config.prefetch)):
 
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
-      params_repl, opt_state_repl, loss_repl, update_rng_repl = update_fn_repl(
+      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl = update_fn_repl(
           params_repl, opt_state_repl, batch, update_rng_repl)
 
     for hook in hooks:
@@ -197,11 +246,29 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       img_sec_core_train = (config.batch * (step - lstep) /
                             (time.time() - lt0)) / jax.device_count()
       lt0, lstep = time.time(), step
+
+      train_loss = float(flax.jax_utils.unreplicate(loss_repl))
+      grad_norm = float(flax.jax_utils.unreplicate(grad_norm_repl))
+      param_norm = float(tree_norm(flax.jax_utils.unreplicate(params_repl)))
+      current_lr = float(lr_fn(step))
+
       writer.write_scalars(
           step,
           dict(
-              train_loss=float(flax.jax_utils.unreplicate(loss_repl)),
+              train_loss=train_loss,
               img_sec_core_train=img_sec_core_train))
+
+      # W&B logging - Priority 1 & 2 train metrics
+      wandb.log({
+          'Train/loss': train_loss,
+          'Train/learning_rate': current_lr,
+          'Optim/lr': current_lr,
+          'Optim/grad_global_norm': grad_norm,
+          'Optim/param_global_norm': param_norm,
+          'System/img_sec_core_train': img_sec_core_train,
+          'step': step
+      }, step=step)
+
       done = step / total_steps
       logging.info(f'Step: {step}/{total_steps} {100*done:.1f}%, '  # pylint: disable=logging-fstring-interpolation
                    f'img/sec/core: {img_sec_core_train:.1f}, '
@@ -212,15 +279,50 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
         (step == total_steps)):
 
       accuracies = []
+      all_logits = []
+      all_labels = []
+      val_losses = []
+
+      def cross_entropy_loss(*, logits, labels):
+        logp = jax.nn.log_softmax(logits)
+        return -jnp.mean(jnp.sum(logp * labels, axis=1))
+
       lt0 = time.time()
       for test_batch in input_pipeline.prefetch(ds_test, config.prefetch):
         logits = infer_fn_repl(
             dict(params=params_repl), test_batch['image'])
+
+        # Flatten replicated outputs
+        logits_flat = logits.reshape(-1, logits.shape[-1])
+        labels_flat = test_batch['label'].reshape(-1, test_batch['label'].shape[-1])
+
+        # Compute val loss
+        val_loss = float(cross_entropy_loss(logits=logits_flat, labels=labels_flat))
+        val_losses.append(val_loss)
+
+        # Collect for metrics
+        all_logits.append(logits_flat)
+        all_labels.append(labels_flat)
+
         accuracies.append(
-            (np.argmax(logits,
-                       axis=-1) == np.argmax(test_batch['label'],
-                                             axis=-1)).mean())
+            (np.argmax(logits_flat, axis=-1) == np.argmax(labels_flat, axis=-1)).mean())
+
+      # Concatenate all batches
+      all_logits = np.concatenate(all_logits, axis=0)
+      all_labels = np.concatenate(all_labels, axis=0)
+      y_true = np.argmax(all_labels, axis=-1)
+      y_pred = np.argmax(all_logits, axis=-1)
+
       accuracy_test = np.mean(accuracies)
+      val_loss = np.mean(val_losses)
+      top5_accuracy = compute_topk_accuracy(all_logits, all_labels, k=5)
+
+      # Compute per-class accuracy
+      per_class_acc = compute_per_class_accuracy(y_true, y_pred, num_classes=dataset_info['num_classes'])
+
+      # Compute confusion matrix
+      conf_matrix = compute_confusion_matrix(y_true, y_pred, num_classes=dataset_info['num_classes'])
+
       img_sec_core_test = (
           config.batch_eval * ds_test.cardinality().numpy() /
           (time.time() - lt0) / jax.device_count())
@@ -230,6 +332,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       logging.info(f'Step: {step} '  # pylint: disable=logging-fstring-interpolation
                    f'Learning rate: {lr:.7f}, '
                    f'Test accuracy: {accuracy_test:0.5f}, '
+                   f'Val loss: {val_loss:0.5f}, '
                    f'img/sec/core: {img_sec_core_test:.1f}')
       writer.write_scalars(
           step,
@@ -237,6 +340,96 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               accuracy_test=accuracy_test,
               lr=lr,
               img_sec_core_test=img_sec_core_test))
+
+      # W&B logging - Priority 1 validation metrics
+      class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                     'dog', 'frog', 'horse', 'ship', 'truck']
+      wandb_metrics = {
+          'Val/loss': val_loss,
+          'Val/accuracy': accuracy_test,
+          'Val/top1_accuracy': accuracy_test,
+          'Val/top5_accuracy': top5_accuracy,
+          'System/img_sec_core_test': img_sec_core_test,
+          'step': step
+      }
+
+      # Add per-class accuracy
+      for class_name, acc in per_class_acc.items():
+        wandb_metrics[f'Val/per_class_accuracy/{class_name}'] = acc
+
+      # Log confusion matrix
+      wandb_metrics['Charts/confusion_matrix'] = wandb.plot.confusion_matrix(
+          probs=None,
+          y_true=y_true,
+          preds=y_pred,
+          class_names=class_names
+      )
+
+      wandb.log(wandb_metrics, step=step)
+
+      # Log activation stats and Gram-lowrank metrics (Priority 2 & Gram-specific)
+      # Use a single batch to capture intermediates
+      try:
+        sample_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
+        # Run forward pass with mutable intermediates collection
+        _, state = model.apply(
+            {'params': flax.jax_utils.unreplicate(params_repl)},
+            sample_batch['image'][0:1],  # Single device, single sample
+            train=False,
+            mutable=['intermediates']
+        )
+
+        # Extract intermediates if available
+        if 'intermediates' in state:
+          intermediates = state['intermediates']
+          activation_metrics = {}
+
+          # Log activation and Gram-lowrank stats per block
+          # Traverse the intermediates tree to find encoder blocks
+          if 'Transformer' in intermediates:
+            transformer_intermediates = intermediates['Transformer']
+            for block_name, block_intermediates in transformer_intermediates.items():
+              if 'encoderblock_' in block_name:
+                block_idx = block_name.split('_')[-1]
+
+                # Log MHSA and MLP activation stats
+                if 'mhsa_out_mean' in block_intermediates:
+                  activation_metrics[f'Activations/block_{block_idx}/mhsa_out_mean'] = float(
+                      block_intermediates['mhsa_out_mean'][0])
+                if 'mhsa_out_std' in block_intermediates:
+                  activation_metrics[f'Activations/block_{block_idx}/mhsa_out_std'] = float(
+                      block_intermediates['mhsa_out_std'][0])
+                if 'mlp_out_mean' in block_intermediates:
+                  activation_metrics[f'Activations/block_{block_idx}/mlp_out_mean'] = float(
+                      block_intermediates['mlp_out_mean'][0])
+                if 'mlp_out_std' in block_intermediates:
+                  activation_metrics[f'Activations/block_{block_idx}/mlp_out_std'] = float(
+                      block_intermediates['mlp_out_std'][0])
+
+                # Log Gram-lowrank metrics if available
+                if 'GramLowRankMHSAResidual_0' in block_intermediates:
+                  gram_intermediates = block_intermediates['GramLowRankMHSAResidual_0']
+                  if 'T_norm' in gram_intermediates:
+                    activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
+                        gram_intermediates['T_norm'][0])
+                  if 'Z_norm' in gram_intermediates:
+                    activation_metrics[f'GramLowRank/block_{block_idx}/Z_norm'] = float(
+                        gram_intermediates['Z_norm'][0])
+                  if 'T_over_Z_norm' in gram_intermediates:
+                    activation_metrics[f'GramLowRank/block_{block_idx}/T_over_Z_norm'] = float(
+                        gram_intermediates['T_over_Z_norm'][0])
+                  if 'A_norm' in gram_intermediates:
+                    activation_metrics[f'GramLowRank/block_{block_idx}/A_norm'] = float(
+                        gram_intermediates['A_norm'][0])
+                  if 'B_norm' in gram_intermediates:
+                    activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
+                        gram_intermediates['B_norm'][0])
+
+          if activation_metrics:
+            wandb.log(activation_metrics, step=step)
+
+      except Exception as e:
+        logging.warning(f'Failed to capture intermediates for logging: {e}')
 
     # Store checkpoint.
     if ((config.checkpoint_every and step % config.eval_every == 0) or
@@ -246,5 +439,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                     flax.jax_utils.unreplicate(opt_state_repl), step), step)
       logging.info('Stored checkpoint at step %d to "%s"', step,
                    checkpoint_path)
+
+  # Finish W&B run
+  wandb.finish()
 
   return flax.jax_utils.unreplicate(params_repl)
