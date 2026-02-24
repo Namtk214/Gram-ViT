@@ -188,12 +188,18 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
           rngs=dict(dropout=dropout_rng),
           inputs=images,
           train=True)
-      return cross_entropy_loss(logits=logits, labels=labels)
+      return cross_entropy_loss(logits=logits, labels=labels), logits
 
-    l, g = utils.accumulate_gradient(
-        jax.value_and_grad(loss_fn), params, batch['image'], batch['label'],
+    (l, logits), g = utils.accumulate_gradient(
+        jax.value_and_grad(loss_fn, has_aux=True), params, batch['image'], batch['label'],
         accum_steps)
     g = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='batch'), g)
+
+    # Compute accuracy
+    preds = jnp.argmax(logits, axis=-1)
+    labels_idx = jnp.argmax(batch['label'], axis=-1)
+    correct = jnp.equal(preds, labels_idx)
+    accuracy = jnp.mean(correct)
 
     # Compute gradient norm before updates
     grad_norm = tree_norm(g)
@@ -201,9 +207,10 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
     updates, opt_state = tx.update(g, opt_state)
     params = optax.apply_updates(params, updates)
     l = jax.lax.pmean(l, axis_name='batch')
+    accuracy = jax.lax.pmean(accuracy, axis_name='batch')
     grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
 
-    return params, opt_state, l, new_rng, grad_norm
+    return params, opt_state, l, new_rng, grad_norm, accuracy
 
   return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0,))
 
@@ -369,7 +376,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       input_pipeline.prefetch(ds_train, config.prefetch)):
 
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
-      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl = update_fn_repl(
+      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl, train_accuracy_repl = update_fn_repl(
           params_repl, opt_state_repl, batch, update_rng_repl)
 
     for hook in hooks:
@@ -387,6 +394,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       lt0, lstep = time.time(), step
 
       train_loss = float(flax.jax_utils.unreplicate(loss_repl))
+      train_accuracy = float(flax.jax_utils.unreplicate(train_accuracy_repl))
       grad_norm = float(flax.jax_utils.unreplicate(grad_norm_repl))
       param_norm = float(tree_norm(flax.jax_utils.unreplicate(params_repl)))
       current_lr = float(lr_fn(step))
@@ -395,12 +403,14 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
           step,
           dict(
               train_loss=train_loss,
+              train_accuracy=train_accuracy,
               img_sec_core_train=img_sec_core_train))
 
       # W&B logging - Priority 1 & 2 train metrics
       if use_wandb:
         wandb.log({
             'Train/loss': train_loss,
+            'Train/accuracy': train_accuracy,
             'Train/learning_rate': current_lr,
             'Optim/lr': current_lr,
             'Optim/grad_global_norm': grad_norm,
@@ -411,6 +421,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
       done = step / total_steps
       logging.info(f'Step: {step}/{total_steps} {100*done:.1f}%, '  # pylint: disable=logging-fstring-interpolation
+                   f'Train loss: {train_loss:.4f}, '
+                   f'Train acc: {train_accuracy:.4f}, '
                    f'img/sec/core: {img_sec_core_train:.1f}, '
                    f'ETA: {(time.time()-t0)/done*(1-done)/3600:.2f}h')
 
