@@ -595,13 +595,17 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                       activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
                           gram_intermediates['B_norm'][0])
                       gram_found += 1
-                    if 'A_normed_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/A_normed_norm'] = float(
-                          gram_intermediates['A_normed_norm'][0])
+                    if 'T_normed_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/T_normed_norm'] = float(
+                          gram_intermediates['T_normed_norm'][0])
                       gram_found += 1
-                    if 'B_normed_norm' in gram_intermediates:
-                      activation_metrics[f'GramLowRank/block_{block_idx}/B_normed_norm'] = float(
-                          gram_intermediates['B_normed_norm'][0])
+                    if 'X_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/X_norm'] = float(
+                          gram_intermediates['X_norm'][0])
+                      gram_found += 1
+                    if 'X_normed_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/X_normed_norm'] = float(
+                          gram_intermediates['X_normed_norm'][0])
                       gram_found += 1
 
                     if gram_found > 0:

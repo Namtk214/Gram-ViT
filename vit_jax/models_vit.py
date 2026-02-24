@@ -105,10 +105,9 @@ class MlpBlock(nn.Module):
 class GramLowRankMHSAResidual(nn.Module):
   """Gram + Low-Rank residual correction for MHSA output with RMSNorm.
 
-  Adds a correction term to MHSA output based on token Gram matrix and
-  low-rank matrices A and B with RMSNorm applied:
-    Y = Z + T, where T = G_t(RMSNorm(A) @ RMSNorm(B))
-    G_t = XX^T / D (token Gram matrix)
+  Adds a correction term to MHSA output:
+    Y = Z + RMSNorm(T), where T = G_t(AB)
+    G_t = RMSNorm(X) @ RMSNorm(X)^T / D (token Gram matrix with normalized input)
 
   Attributes:
     rank: Rank for low-rank matrices A and B.
@@ -129,21 +128,27 @@ class GramLowRankMHSAResidual(nn.Module):
       z_mhsa_out: Output from MHSA, shape [B, N, D].
 
     Returns:
-      Y = Z + T, where T is the correction term, shape [B, N, D].
+      Y = Z + RMSNorm(T), where T is the correction term, shape [B, N, D].
     """
     # Get shapes
     batch_size, num_tokens, hidden_dim = x_mhsa_in.shape
 
-    # Step 1: Compute token Gram matrix G_t = XX^T / D
-    # Shape: [B, N, N]
-    gram_matrix = jnp.matmul(x_mhsa_in, jnp.transpose(x_mhsa_in, (0, 2, 1))) / hidden_dim
+    # Step 1: Apply RMSNorm to X before computing Gram matrix
+    # RMSNorm: normalize across hidden_dim dimension (per token)
+    x_rms = jnp.sqrt(jnp.mean(x_mhsa_in ** 2, axis=-1, keepdims=True) + self.eps)
+    x_scale = self.param('X_scale', nn.initializers.ones, (1, 1, hidden_dim), self.param_dtype)
+    x_normed = (x_mhsa_in / x_rms) * x_scale
 
-    # Step 2: Define low-rank parameters A and B
+    # Step 2: Compute token Gram matrix G_t = X_normed @ X_normed^T / D
+    # Shape: [B, N, N]
+    gram_matrix = jnp.matmul(x_normed, jnp.transpose(x_normed, (0, 2, 1))) / hidden_dim
+
+    # Step 3: Define low-rank parameters A and B
     # A: [N, r], initialized with He/Kaiming uniform
     # B: [r, D], initialized with zeros (makes branch no-op initially)
     a_matrix = self.param(
         'A',
-        nn.initializers.he_uniform(),  # Changed from normal to he_uniform
+        nn.initializers.he_uniform(),
         (num_tokens, self.rank),
         self.param_dtype
     )
@@ -155,44 +160,40 @@ class GramLowRankMHSAResidual(nn.Module):
         self.param_dtype
     )
 
-    # Step 3: Apply RMSNorm to A and B
-    # RMSNorm(x) = x / sqrt(mean(x^2) + eps) * scale
-    # A RMSNorm: normalize across rank dimension (dim=-1)
-    a_rms = jnp.sqrt(jnp.mean(a_matrix ** 2, axis=-1, keepdims=True) + self.eps)
-    a_scale = self.param('A_scale', nn.initializers.ones, (1, self.rank), self.param_dtype)
-    a_normed = (a_matrix / a_rms) * a_scale
-
-    # B RMSNorm: normalize across hidden_dim dimension (dim=-1)
-    b_rms = jnp.sqrt(jnp.mean(b_matrix ** 2, axis=-1, keepdims=True) + self.eps)
-    b_scale = self.param('B_scale', nn.initializers.ones, (1, hidden_dim), self.param_dtype)
-    b_normed = (b_matrix / b_rms) * b_scale
-
-    # Step 4: Compute P = RMSNorm(A) @ RMSNorm(B), shape [N, D]
-    p_matrix = jnp.matmul(a_normed, b_normed)
+    # Step 4: Compute P = AB, shape [N, D]
+    p_matrix = jnp.matmul(a_matrix, b_matrix)
 
     # Step 5: Compute correction term T = G_t @ P, shape [B, N, D]
     correction_term = jnp.matmul(gram_matrix, p_matrix)
 
+    # Step 6: Apply RMSNorm to correction term T before adding to Z
+    # RMSNorm: normalize across hidden_dim dimension (per token)
+    t_rms = jnp.sqrt(jnp.mean(correction_term ** 2, axis=-1, keepdims=True) + self.eps)
+    t_scale = self.param('T_scale', nn.initializers.ones, (1, 1, hidden_dim), self.param_dtype)
+    t_normed = (correction_term / t_rms) * t_scale
+
     # Compute metrics for W&B logging
     t_norm = jnp.linalg.norm(correction_term)
+    t_normed_norm = jnp.linalg.norm(t_normed)
     z_norm = jnp.linalg.norm(z_mhsa_out)
-    t_over_z_norm = t_norm / (z_norm + 1e-8)  # avoid division by zero
+    t_over_z_norm = t_norm / (z_norm + 1e-8)
+    x_norm = jnp.linalg.norm(x_mhsa_in)
+    x_normed_norm = jnp.linalg.norm(x_normed)
     a_norm = jnp.linalg.norm(a_matrix)
     b_norm = jnp.linalg.norm(b_matrix)
-    a_normed_norm = jnp.linalg.norm(a_normed)
-    b_normed_norm = jnp.linalg.norm(b_normed)
 
     # Sow metrics for logging (stored in 'intermediates' collection)
     self.sow('intermediates', 'T_norm', t_norm)
+    self.sow('intermediates', 'T_normed_norm', t_normed_norm)
     self.sow('intermediates', 'Z_norm', z_norm)
     self.sow('intermediates', 'T_over_Z_norm', t_over_z_norm)
+    self.sow('intermediates', 'X_norm', x_norm)
+    self.sow('intermediates', 'X_normed_norm', x_normed_norm)
     self.sow('intermediates', 'A_norm', a_norm)
     self.sow('intermediates', 'B_norm', b_norm)
-    self.sow('intermediates', 'A_normed_norm', a_normed_norm)
-    self.sow('intermediates', 'B_normed_norm', b_normed_norm)
 
-    # Step 6: Add correction to MHSA output
-    return z_mhsa_out + correction_term
+    # Step 7: Add normalized correction to MHSA output
+    return z_mhsa_out + t_normed
 
 
 class Encoder1DBlock(nn.Module):
