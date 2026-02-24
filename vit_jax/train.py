@@ -43,11 +43,19 @@ def compute_confusion_matrix(y_true, y_pred, num_classes=10):
   return conf_matrix
 
 
-def compute_per_class_accuracy(y_true, y_pred, num_classes=10):
-  """Compute per-class accuracy."""
+def compute_per_class_accuracy(y_true, y_pred, class_names):
+  """Compute per-class accuracy.
+
+  Args:
+    y_true: True labels (class indices).
+    y_pred: Predicted labels (class indices).
+    class_names: List of class names.
+
+  Returns:
+    Dictionary mapping class names to their accuracies.
+  """
   per_class_acc = {}
-  class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-                 'dog', 'frog', 'horse', 'ship', 'truck']
+  num_classes = len(class_names)
   for i in range(num_classes):
     mask = y_true == i
     if mask.sum() > 0:
@@ -115,12 +123,20 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   """Runs training interleaved with evaluation."""
 
   # Initialize Weights & Biases
-  wandb.init(
-      project="gram-vit-cifar10",
-      name=f"{config.model.model_name}_{config.dataset}",
-      config=config.to_dict(),
-      dir=workdir
-  )
+  # Will use existing API key from environment (WANDB_API_KEY) or ~/.netrc
+  try:
+    wandb.init(
+        project="gram-vit-cifar10",
+        name=f"{config.model.model_name}_{config.dataset}",
+        config=config.to_dict(),
+        dir=workdir,
+        resume="allow"  # Allow resuming if run with same name
+    )
+    use_wandb = True
+    logging.info("W&B initialized successfully")
+  except Exception as e:
+    logging.warning(f"W&B initialization failed: {e}. Running without W&B logging.")
+    use_wandb = False
 
   # Setup input pipeline
   dataset_info = input_pipeline.get_dataset_info(config.dataset, 'train')
@@ -259,15 +275,16 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               img_sec_core_train=img_sec_core_train))
 
       # W&B logging - Priority 1 & 2 train metrics
-      wandb.log({
-          'Train/loss': train_loss,
-          'Train/learning_rate': current_lr,
-          'Optim/lr': current_lr,
-          'Optim/grad_global_norm': grad_norm,
-          'Optim/param_global_norm': param_norm,
-          'System/img_sec_core_train': img_sec_core_train,
-          'step': step
-      }, step=step)
+      if use_wandb:
+        wandb.log({
+            'Train/loss': train_loss,
+            'Train/learning_rate': current_lr,
+            'Optim/lr': current_lr,
+            'Optim/grad_global_norm': grad_norm,
+            'Optim/param_global_norm': param_norm,
+            'System/img_sec_core_train': img_sec_core_train,
+            'step': step
+        }, step=step)
 
       done = step / total_steps
       logging.info(f'Step: {step}/{total_steps} {100*done:.1f}%, '  # pylint: disable=logging-fstring-interpolation
@@ -317,11 +334,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       val_loss = np.mean(val_losses)
       top5_accuracy = compute_topk_accuracy(all_logits, all_labels, k=5)
 
-      # Compute per-class accuracy
-      per_class_acc = compute_per_class_accuracy(y_true, y_pred, num_classes=dataset_info['num_classes'])
+      # Get class names from dataset info
+      class_names = [dataset_info['int2str'](i) for i in range(dataset_info['num_classes'])]
 
-      # Compute confusion matrix
-      conf_matrix = compute_confusion_matrix(y_true, y_pred, num_classes=dataset_info['num_classes'])
+      # Compute per-class accuracy
+      per_class_acc = compute_per_class_accuracy(y_true, y_pred, class_names)
 
       img_sec_core_test = (
           config.batch_eval * ds_test.cardinality().numpy() /
@@ -342,94 +359,94 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               img_sec_core_test=img_sec_core_test))
 
       # W&B logging - Priority 1 validation metrics
-      class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-                     'dog', 'frog', 'horse', 'ship', 'truck']
-      wandb_metrics = {
-          'Val/loss': val_loss,
-          'Val/accuracy': accuracy_test,
-          'Val/top1_accuracy': accuracy_test,
-          'Val/top5_accuracy': top5_accuracy,
-          'System/img_sec_core_test': img_sec_core_test,
-          'step': step
-      }
+      if use_wandb:
+        wandb_metrics = {
+            'Val/loss': val_loss,
+            'Val/accuracy': accuracy_test,
+            'Val/top1_accuracy': accuracy_test,
+            'Val/top5_accuracy': top5_accuracy,
+            'System/img_sec_core_test': img_sec_core_test,
+            'step': step
+        }
 
-      # Add per-class accuracy
-      for class_name, acc in per_class_acc.items():
-        wandb_metrics[f'Val/per_class_accuracy/{class_name}'] = acc
+        # Add per-class accuracy
+        for class_name, acc in per_class_acc.items():
+          wandb_metrics[f'Val/per_class_accuracy/{class_name}'] = acc
 
-      # Log confusion matrix
-      wandb_metrics['Charts/confusion_matrix'] = wandb.plot.confusion_matrix(
-          probs=None,
-          y_true=y_true,
-          preds=y_pred,
-          class_names=class_names
-      )
+        # Log confusion matrix
+        wandb_metrics['Charts/confusion_matrix'] = wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=y_true,
+            preds=y_pred,
+            class_names=class_names
+        )
 
-      wandb.log(wandb_metrics, step=step)
+        wandb.log(wandb_metrics, step=step)
 
       # Log activation stats and Gram-lowrank metrics (Priority 2 & Gram-specific)
       # Use a single batch to capture intermediates
-      try:
-        sample_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
-        # Run forward pass with mutable intermediates collection
-        _, state = model.apply(
-            {'params': flax.jax_utils.unreplicate(params_repl)},
-            sample_batch['image'][0:1],  # Single device, single sample
-            train=False,
-            mutable=['intermediates']
-        )
+      if use_wandb:
+        try:
+          sample_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
+          # Run forward pass with mutable intermediates collection
+          _, state = model.apply(
+              {'params': flax.jax_utils.unreplicate(params_repl)},
+              sample_batch['image'][0:1],  # Single device, single sample
+              train=False,
+              mutable=['intermediates']
+          )
 
-        # Extract intermediates if available
-        if 'intermediates' in state:
-          intermediates = state['intermediates']
-          activation_metrics = {}
+          # Extract intermediates if available
+          if 'intermediates' in state:
+            intermediates = state['intermediates']
+            activation_metrics = {}
 
-          # Log activation and Gram-lowrank stats per block
-          # Traverse the intermediates tree to find encoder blocks
-          if 'Transformer' in intermediates:
-            transformer_intermediates = intermediates['Transformer']
-            for block_name, block_intermediates in transformer_intermediates.items():
-              if 'encoderblock_' in block_name:
-                block_idx = block_name.split('_')[-1]
+            # Log activation and Gram-lowrank stats per block
+            # Traverse the intermediates tree to find encoder blocks
+            if 'Transformer' in intermediates:
+              transformer_intermediates = intermediates['Transformer']
+              for block_name, block_intermediates in transformer_intermediates.items():
+                if 'encoderblock_' in block_name:
+                  block_idx = block_name.split('_')[-1]
 
-                # Log MHSA and MLP activation stats
-                if 'mhsa_out_mean' in block_intermediates:
-                  activation_metrics[f'Activations/block_{block_idx}/mhsa_out_mean'] = float(
-                      block_intermediates['mhsa_out_mean'][0])
-                if 'mhsa_out_std' in block_intermediates:
-                  activation_metrics[f'Activations/block_{block_idx}/mhsa_out_std'] = float(
-                      block_intermediates['mhsa_out_std'][0])
-                if 'mlp_out_mean' in block_intermediates:
-                  activation_metrics[f'Activations/block_{block_idx}/mlp_out_mean'] = float(
-                      block_intermediates['mlp_out_mean'][0])
-                if 'mlp_out_std' in block_intermediates:
-                  activation_metrics[f'Activations/block_{block_idx}/mlp_out_std'] = float(
-                      block_intermediates['mlp_out_std'][0])
+                  # Log MHSA and MLP activation stats
+                  if 'mhsa_out_mean' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/mhsa_out_mean'] = float(
+                        block_intermediates['mhsa_out_mean'][0])
+                  if 'mhsa_out_std' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/mhsa_out_std'] = float(
+                        block_intermediates['mhsa_out_std'][0])
+                  if 'mlp_out_mean' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/mlp_out_mean'] = float(
+                        block_intermediates['mlp_out_mean'][0])
+                  if 'mlp_out_std' in block_intermediates:
+                    activation_metrics[f'Activations/block_{block_idx}/mlp_out_std'] = float(
+                        block_intermediates['mlp_out_std'][0])
 
-                # Log Gram-lowrank metrics if available
-                if 'GramLowRankMHSAResidual_0' in block_intermediates:
-                  gram_intermediates = block_intermediates['GramLowRankMHSAResidual_0']
-                  if 'T_norm' in gram_intermediates:
-                    activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
-                        gram_intermediates['T_norm'][0])
-                  if 'Z_norm' in gram_intermediates:
-                    activation_metrics[f'GramLowRank/block_{block_idx}/Z_norm'] = float(
-                        gram_intermediates['Z_norm'][0])
-                  if 'T_over_Z_norm' in gram_intermediates:
-                    activation_metrics[f'GramLowRank/block_{block_idx}/T_over_Z_norm'] = float(
-                        gram_intermediates['T_over_Z_norm'][0])
-                  if 'A_norm' in gram_intermediates:
-                    activation_metrics[f'GramLowRank/block_{block_idx}/A_norm'] = float(
-                        gram_intermediates['A_norm'][0])
-                  if 'B_norm' in gram_intermediates:
-                    activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
-                        gram_intermediates['B_norm'][0])
+                  # Log Gram-lowrank metrics if available
+                  if 'GramLowRankMHSAResidual_0' in block_intermediates:
+                    gram_intermediates = block_intermediates['GramLowRankMHSAResidual_0']
+                    if 'T_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
+                          gram_intermediates['T_norm'][0])
+                    if 'Z_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/Z_norm'] = float(
+                          gram_intermediates['Z_norm'][0])
+                    if 'T_over_Z_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/T_over_Z_norm'] = float(
+                          gram_intermediates['T_over_Z_norm'][0])
+                    if 'A_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/A_norm'] = float(
+                          gram_intermediates['A_norm'][0])
+                    if 'B_norm' in gram_intermediates:
+                      activation_metrics[f'GramLowRank/block_{block_idx}/B_norm'] = float(
+                          gram_intermediates['B_norm'][0])
 
-          if activation_metrics:
-            wandb.log(activation_metrics, step=step)
+            if activation_metrics:
+              wandb.log(activation_metrics, step=step)
 
-      except Exception as e:
-        logging.warning(f'Failed to capture intermediates for logging: {e}')
+        except Exception as e:
+          logging.warning(f'Failed to capture intermediates for logging: {e}')
 
     # Store checkpoint.
     if ((config.checkpoint_every and step % config.eval_every == 0) or
@@ -441,6 +458,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                    checkpoint_path)
 
   # Finish W&B run
-  wandb.finish()
+  if use_wandb:
+    wandb.finish()
 
   return flax.jax_utils.unreplicate(params_repl)
