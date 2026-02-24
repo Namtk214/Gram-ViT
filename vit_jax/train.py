@@ -161,39 +161,57 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   # Use JIT to make sure params reside in CPU memory.
   variables = jax.jit(init_model, backend='cpu')()
 
-  model_or_filename = config.get('model_or_filename')
-  if model_or_filename:
-    # Loading model from repo published with  "How to train your ViT? Data,
-    # Augmentation, and Regularization in Vision Transformers" paper.
-    # https://arxiv.org/abs/2106.10270
-    if '-' in model_or_filename:
-      filename = model_or_filename
-    else:
-      # Select best checkpoint from i21k pretraining by final upstream
-      # validation accuracy.
-      df = checkpoint.get_augreg_df(directory=config.pretrained_dir)
-      sel = df.filename.apply(
-          lambda filename: filename.split('-')[0] == model_or_filename)
-      best = df.loc[sel].query('ds=="i21k"').sort_values('final_val').iloc[-1]
-      filename = best.filename
-      logging.info('Selected fillename="%s" for "%s" with final_val=%.3f',
-                   filename, model_or_filename, best.final_val)
-    pretrained_path = os.path.join(config.pretrained_dir,
-                                   f'{config.model.model_name}.npz')
-  else:
-    # ViT / Mixer papers
-    filename = config.model.model_name
+  # Check if we should load pretrained weights
+  train_from_scratch = config.get('train_from_scratch', False)
 
-  pretrained_path = os.path.join(config.pretrained_dir, f'{filename}.npz')
-  if not tf.io.gfile.exists(pretrained_path):
-    raise ValueError(
-        f'Could not find "{pretrained_path}" - you can download models from '
-        '"gs://vit_models/imagenet21k" or directly set '
-        '--config.pretrained_dir="gs://vit_models/imagenet21k".')
-  params = checkpoint.load_pretrained(
-      pretrained_path=pretrained_path,
-      init_params=variables['params'],
-      model_config=config.model)
+  if train_from_scratch:
+    # Training from scratch - use randomly initialized parameters
+    logging.info('🚀 Training from scratch (no pretrained weights)')
+    params = variables['params']
+  else:
+    # Try to load pretrained weights
+    model_or_filename = config.get('model_or_filename')
+    if model_or_filename:
+      # Loading model from repo published with  "How to train your ViT? Data,
+      # Augmentation, and Regularization in Vision Transformers" paper.
+      # https://arxiv.org/abs/2106.10270
+      if '-' in model_or_filename:
+        filename = model_or_filename
+      else:
+        # Select best checkpoint from i21k pretraining by final upstream
+        # validation accuracy.
+        df = checkpoint.get_augreg_df(directory=config.pretrained_dir)
+        sel = df.filename.apply(
+            lambda filename: filename.split('-')[0] == model_or_filename)
+        best = df.loc[sel].query('ds=="i21k"').sort_values('final_val').iloc[-1]
+        filename = best.filename
+        logging.info('Selected fillename="%s" for "%s" with final_val=%.3f',
+                     filename, model_or_filename, best.final_val)
+      pretrained_path = os.path.join(config.pretrained_dir,
+                                     f'{config.model.model_name}.npz')
+    else:
+      # ViT / Mixer papers
+      filename = config.model.model_name
+
+    pretrained_path = os.path.join(config.pretrained_dir, f'{filename}.npz')
+
+    # Check if pretrained file exists
+    if tf.io.gfile.exists(pretrained_path):
+      logging.info('Loading pretrained weights from "%s"', pretrained_path)
+      params = checkpoint.load_pretrained(
+          pretrained_path=pretrained_path,
+          init_params=variables['params'],
+          model_config=config.model)
+    else:
+      # File doesn't exist - warn and train from scratch
+      logging.warning(
+          'Pretrained weights not found at "%s". Training from scratch instead.',
+          pretrained_path)
+      logging.warning(
+          'To download pretrained weights: '
+          'gsutil cp gs://vit_models/imagenet21k/%s.npz %s',
+          config.model.model_name, pretrained_path)
+      params = variables['params']
 
   total_steps = config.total_steps
 
