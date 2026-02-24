@@ -259,6 +259,14 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   # Use JIT to make sure params reside in CPU memory.
   variables = jax.jit(init_model, backend='cpu')()
 
+  # Log Gram-lowrank configuration
+  use_gram_lowrank = config.model.transformer.get('use_gram_lowrank_mhsa', False)
+  if use_gram_lowrank:
+    gram_rank = config.model.transformer.get('gram_lowrank_rank', 8)
+    logging.info('✓ Gram-LowRank ENABLED: rank=%d', gram_rank)
+  else:
+    logging.info('✗ Gram-LowRank DISABLED')
+
   # Check if we should load pretrained weights
   train_from_scratch = config.get('train_from_scratch', False)
 
@@ -557,9 +565,16 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                     logging.info('  ✓ Collected %d activation metrics for block_%s', activation_found, block_idx)
 
                   # Log Gram-lowrank metrics if available
-                  if 'GramLowRankMHSAResidual_0' in block_intermediates:
-                    gram_intermediates = block_intermediates['GramLowRankMHSAResidual_0']
-                    logging.info('  ✓ Found GramLowRankMHSAResidual_0, keys: %s', list(gram_intermediates.keys()))
+                  # Find GramLowRank module (name might vary, so search for it)
+                  gram_key = None
+                  for key in block_intermediates.keys():
+                    if 'GramLowRank' in key:
+                      gram_key = key
+                      break
+
+                  if gram_key is not None:
+                    gram_intermediates = block_intermediates[gram_key]
+                    logging.info('  ✓ Found %s, keys: %s', gram_key, list(gram_intermediates.keys()))
                     gram_found = 0
                     if 'T_norm' in gram_intermediates:
                       activation_metrics[f'GramLowRank/block_{block_idx}/T_norm'] = float(
@@ -584,8 +599,15 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
                     if gram_found > 0:
                       logging.info('  ✓ Collected %d Gram-lowrank metrics for block_%s', gram_found, block_idx)
+                    else:
+                      logging.warning('  ✗ GramLowRank module found but no metrics collected for block_%s', block_idx)
                   else:
-                    logging.warning('  ✗ No GramLowRankMHSAResidual_0 found in block_%s', block_idx)
+                    # Only log warning if Gram-lowrank is enabled in config
+                    if use_gram_lowrank:
+                      logging.warning('  ✗ No GramLowRank module found in block_%s (available keys: %s)',
+                                    block_idx, list(block_intermediates.keys()))
+                    else:
+                      logging.debug('  GramLowRank disabled in config, skipping for block_%s', block_idx)
 
               logging.info('✓ Processed %d encoder blocks', encoder_block_count)
             else:
