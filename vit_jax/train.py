@@ -405,6 +405,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       # Use a single batch to capture intermediates
       if use_wandb:
         try:
+          logging.info('Attempting to capture intermediates for logging...')
           sample_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
           # Run forward pass with mutable intermediates collection
           _, state = model.apply(
@@ -416,8 +417,11 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
           # Extract intermediates if available
           if 'intermediates' in state:
+            logging.info('Intermediates found in state')
             intermediates = state['intermediates']
             activation_metrics = {}
+          else:
+            logging.warning('No intermediates found in state. Available keys: %s', state.keys())
 
             # Log activation and Gram-lowrank stats per block
             # Traverse the intermediates tree to find encoder blocks
@@ -461,10 +465,15 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                           gram_intermediates['B_norm'][0])
 
             if activation_metrics:
+              logging.info('Logging %d activation/gram metrics to W&B', len(activation_metrics))
               wandb.log(activation_metrics, step=step)
+            else:
+              logging.warning('No activation metrics collected')
 
         except Exception as e:
-          logging.warning(f'Failed to capture intermediates for logging: {e}')
+          logging.error('Failed to capture intermediates for logging: %s', str(e))
+          import traceback
+          logging.error('Traceback: %s', traceback.format_exc())
 
     # Store checkpoint.
     if ((config.checkpoint_every and step % config.eval_every == 0) or
