@@ -70,6 +70,9 @@ def get_config():
   # Alternatives : inference_time.
   config.trainer = 'train'
 
+  # Train from scratch without pretrained weights
+  config.train_from_scratch = False
+
   # Will be set from ./models.py
   config.model = None
   # Only used in ./augreg.py configs
