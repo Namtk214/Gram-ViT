@@ -237,7 +237,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
   # Build VisionTransformer architecture
   model_cls = {'ViT': models.VisionTransformer,
-               'Mixer': models.MlpMixer}[config.get('model_type', 'ViT')]
+               'Mixer': models.MlpMixer}[getattr(config, 'model_type', 'ViT')]
   model = model_cls(num_classes=dataset_info['num_classes'], **config.model)
 
   def init_model():
@@ -251,7 +251,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   variables = jax.jit(init_model, backend='cpu')()
 
   # Log Gram-lowrank configuration
-  use_gram_lowrank = config.model.transformer.get('use_gram_lowrank_mhsa', False)
+  use_gram_lowrank = getattr(config.model.transformer, 'use_gram_lowrank_mhsa', False)
 
   # Handle string "True"/"False" from command line
   if isinstance(use_gram_lowrank, str):
@@ -259,15 +259,15 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     logging.warning('Config use_gram_lowrank_mhsa received as string, converted to: %s', use_gram_lowrank)
 
   if use_gram_lowrank:
-    gram_rank = config.model.transformer.get('gram_lowrank_rank', 8)
+    gram_rank = getattr(config.model.transformer, 'gram_lowrank_rank', 8)
     logging.info('✓ Gram-LowRank ENABLED: rank=%d', gram_rank)
   else:
     logging.info('✗ Gram-LowRank DISABLED (value was: %s, type: %s)',
-                 config.model.transformer.get('use_gram_lowrank_mhsa', False),
-                 type(config.model.transformer.get('use_gram_lowrank_mhsa', False)))
+                 getattr(config.model.transformer, 'use_gram_lowrank_mhsa', False),
+                 type(getattr(config.model.transformer, 'use_gram_lowrank_mhsa', False)))
 
   # Check if we should load pretrained weights
-  train_from_scratch = config.get('train_from_scratch', False)
+  train_from_scratch = getattr(config, 'train_from_scratch', False)
 
   if train_from_scratch:
     # Training from scratch - use randomly initialized parameters
@@ -275,7 +275,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     params = variables['params']
   else:
     # Try to load pretrained weights
-    model_or_filename = config.get('model_or_filename')
+    model_or_filename = getattr(config, 'model_or_filename', None)
     if model_or_filename:
       # Loading model from repo published with  "How to train your ViT? Data,
       # Augmentation, and Regularization in Vision Transformers" paper.
