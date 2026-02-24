@@ -201,7 +201,7 @@ class Encoder1DBlock(nn.Module):
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
   # bool = true
-  use_gram_lowrank_mhsa: bool = False 
+  use_gram_lowrank_mhsa: bool = True 
   gram_lowrank_rank: int = 8
   gram_lowrank_a_init_std: float = 1e-2
 
