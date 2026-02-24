@@ -42,7 +42,7 @@ def get_config():
   # Datatype to use for momentum state ("bfloat16" or "float32").
   config.optim_dtype = 'bfloat16'
   # Accumulate gradients over multiple steps to save on memory.
-  config.accum_steps = 2
+  config.accum_steps = 8
 
   # Batch size for training.
   config.batch = 512
