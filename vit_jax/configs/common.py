@@ -42,12 +42,12 @@ def get_config():
   # Datatype to use for momentum state ("bfloat16" or "float32").
   config.optim_dtype = 'bfloat16'
   # Accumulate gradients over multiple steps to save on memory.
-  config.accum_steps = 8
+  config.accum_steps = 2
 
   # Batch size for training.
-  config.batch = 512
+  config.batch = 256
   # Batch size for evaluation.
-  config.batch_eval = 512
+  config.batch_eval = 256
   # Shuffle buffer size.
   config.shuffle_buffer = 50_000
   # Run prediction on validation set every so many steps
