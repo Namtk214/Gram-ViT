@@ -28,6 +28,9 @@ import numpy as np
 import optax
 import tensorflow as tf
 import wandb
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 from vit_jax import checkpoint
 from vit_jax import input_pipeline
@@ -76,6 +79,101 @@ def compute_topk_accuracy(logits, labels, k=5):
 def tree_norm(tree):
   """Compute global norm of a pytree."""
   return jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(tree)))
+
+
+def compute_saliency_map(model_apply, params, image, true_class_idx):
+  """Compute saliency map: gradient of predicted class logit wrt input image.
+
+  Args:
+    model_apply: Model apply function
+    params: Model parameters
+    image: Input image [H, W, C]
+    true_class_idx: True class index for computing gradient
+
+  Returns:
+    Saliency map [H, W] - absolute value of gradient magnitude
+  """
+  def loss_fn(img):
+    logits = model_apply({'params': params}, img[None, ...], train=False)
+    return logits[0, true_class_idx]
+
+  grad_fn = jax.grad(loss_fn)
+  gradient = grad_fn(image)
+
+  # Take absolute value and sum across channels to get [H, W] saliency map
+  saliency = jnp.abs(gradient).sum(axis=-1)
+
+  # Normalize to [0, 1]
+  saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+
+  return saliency
+
+
+def create_saliency_visualization(image, saliency_map, pred_class_name, true_class_name):
+  """Create visualization of image and saliency map side by side.
+
+  Args:
+    image: Original image [H, W, C], values in [0, 1]
+    saliency_map: Saliency map [H, W], values in [0, 1]
+    pred_class_name: Predicted class name
+    true_class_name: True class name
+
+  Returns:
+    Matplotlib figure
+  """
+  fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+
+  # Original image
+  axes[0].imshow(np.array(image))
+  axes[0].set_title(f'True: {true_class_name}\nPred: {pred_class_name}')
+  axes[0].axis('off')
+
+  # Saliency map
+  im = axes[1].imshow(np.array(saliency_map), cmap='hot')
+  axes[1].set_title('Saliency Map')
+  axes[1].axis('off')
+  plt.colorbar(im, ax=axes[1])
+
+  plt.tight_layout()
+  return fig
+
+
+def log_histograms(params, grads, prefix, step, sample_rate=0.1):
+  """Log histograms of parameters and gradients to W&B.
+
+  Args:
+    params: Parameter tree
+    grads: Gradient tree
+    prefix: Prefix for metric names
+    step: Current training step
+    sample_rate: Fraction of params to log (to avoid overhead)
+
+  Returns:
+    Dictionary of histogram metrics for W&B
+  """
+  metrics = {}
+
+  # Flatten trees to lists
+  param_flat = jax.tree_util.tree_leaves(params)
+  grad_flat = jax.tree_util.tree_leaves(grads)
+  param_names = [f'layer_{i}' for i in range(len(param_flat))]
+
+  # Sample a subset
+  num_to_log = max(1, int(len(param_flat) * sample_rate))
+  indices = np.linspace(0, len(param_flat) - 1, num_to_log, dtype=int)
+
+  for idx in indices:
+    name = param_names[idx]
+
+    # Log parameter histogram
+    param_array = np.array(param_flat[idx]).flatten()
+    metrics[f'{prefix}/Params/{name}'] = wandb.Histogram(param_array)
+
+    # Log gradient histogram
+    grad_array = np.array(grad_flat[idx]).flatten()
+    metrics[f'{prefix}/Grads/{name}'] = wandb.Histogram(grad_array)
+
+  return metrics
 
 
 def make_update_fn(*, apply_fn, accum_steps, tx):
@@ -498,8 +596,76 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
               logging.info('Metrics being logged: %s', list(activation_metrics.keys()))
               wandb.log(activation_metrics, step=step)
               logging.info('✓✓✓ Metrics successfully sent to W&B')
+
+              # Log activation histograms (every 500 steps to reduce overhead)
+              if step % 500 == 0:
+                try:
+                  logging.info('Logging activation histograms...')
+                  hist_metrics = {}
+                  if 'Transformer' in intermediates:
+                    transformer_intermediates = intermediates['Transformer']
+                    for block_name, block_intermediates in transformer_intermediates.items():
+                      if 'encoderblock_' in block_name:
+                        block_idx = block_name.split('_')[-1]
+
+                        # MHSA output histogram (first block only to reduce overhead)
+                        if block_idx == '0' and 'mhsa_out_mean' in block_intermediates:
+                          # Get full MHSA output from the forward pass
+                          pass  # We only have mean/std, not full tensor
+
+                  # For now, skip activation histograms since we only sow mean/std
+                  # logging.info('Activation histograms: skipped (only mean/std available)')
+                except Exception as e:
+                  logging.warning('Failed to log activation histograms: %s', str(e))
+
             else:
               logging.warning('✗✗✗ FAILED: No activation metrics collected')
+
+            # Log Saliency Maps (every 500 steps for fixed samples)
+            if step % 500 == 0:
+              try:
+                logging.info('Computing saliency maps...')
+                # Get a few fixed validation samples
+                num_samples = 4
+                sample_images = sample_batch['image'][0][:num_samples]  # [num_samples, H, W, C]
+                sample_labels = sample_batch['label'][0][:num_samples]  # [num_samples, num_classes]
+
+                saliency_images = []
+                params_unrepl = flax.jax_utils.unreplicate(params_repl)
+
+                for i in range(num_samples):
+                  img = sample_images[i]
+                  true_label_idx = np.argmax(sample_labels[i])
+
+                  # Get prediction
+                  logits = model.apply({'params': params_unrepl}, img[None, ...], train=False)
+                  pred_label_idx = np.argmax(logits[0])
+
+                  # Compute saliency map
+                  saliency = compute_saliency_map(
+                      model.apply, params_unrepl, img, true_label_idx)
+
+                  # Get class names
+                  true_class_name = dataset_info['int2str'](true_label_idx)
+                  pred_class_name = dataset_info['int2str'](pred_label_idx)
+
+                  # Create visualization
+                  fig = create_saliency_visualization(
+                      img, saliency, pred_class_name, true_class_name)
+
+                  # Convert to wandb Image
+                  saliency_images.append(wandb.Image(fig))
+                  plt.close(fig)
+
+                # Log to W&B
+                wandb.log({'Vis/saliency_maps': saliency_images}, step=step)
+                logging.info('✓ Logged %d saliency maps', len(saliency_images))
+
+              except Exception as e:
+                logging.warning('Failed to log saliency maps: %s', str(e))
+                import traceback
+                logging.warning('Traceback: %s', traceback.format_exc())
+
           else:
             logging.warning('✗ No intermediates found in state. Available keys: %s', state.keys())
 
@@ -507,6 +673,40 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
           logging.error('Failed to capture intermediates for logging: %s', str(e))
           import traceback
           logging.error('Traceback: %s', traceback.format_exc())
+
+      # Log Parameter and Gradient Histograms (every 1000 steps to reduce overhead)
+      if use_wandb and step % 1000 == 0 and step > 0:
+        try:
+          logging.info('Computing parameter and gradient histograms...')
+
+          # Get unreplicated params
+          params_unrepl = flax.jax_utils.unreplicate(params_repl)
+
+          # Compute gradients on a single batch for histogram logging
+          grad_batch = next(iter(input_pipeline.prefetch(ds_test, 1)))
+
+          def cross_entropy_loss(*, logits, labels):
+            logp = jax.nn.log_softmax(logits)
+            return -jnp.mean(jnp.sum(logp * labels, axis=1))
+
+          def loss_fn(params):
+            logits = model.apply(
+                {'params': params},
+                grad_batch['image'][0][:8],  # Use first 8 samples from first device
+                train=False)
+            return cross_entropy_loss(logits=logits, labels=grad_batch['label'][0][:8])
+
+          grads = jax.grad(loss_fn)(params_unrepl)
+
+          # Log histograms (sample 10% of layers)
+          hist_metrics = log_histograms(params_unrepl, grads, 'Histograms', step, sample_rate=0.1)
+          wandb.log(hist_metrics, step=step)
+          logging.info('✓ Logged %d parameter/gradient histograms', len(hist_metrics))
+
+        except Exception as e:
+          logging.warning('Failed to log param/grad histograms: %s', str(e))
+          import traceback
+          logging.warning('Traceback: %s', traceback.format_exc())
 
     # Store checkpoint.
     if ((config.checkpoint_every and step % config.eval_every == 0) or
