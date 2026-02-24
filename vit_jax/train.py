@@ -195,26 +195,15 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
         accum_steps)
     g = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name='batch'), g)
 
-    # Compute accuracy with a separate forward pass (without dropout for consistent accuracy)
-    logits = apply_fn(
-        dict(params=params),
-        inputs=batch['image'],
-        train=False)
-    preds = jnp.argmax(logits, axis=-1)
-    labels_idx = jnp.argmax(batch['label'], axis=-1)
-    correct = jnp.equal(preds, labels_idx)
-    accuracy = jnp.mean(correct)
-
     # Compute gradient norm before updates
     grad_norm = tree_norm(g)
 
     updates, opt_state = tx.update(g, opt_state)
     params = optax.apply_updates(params, updates)
     l = jax.lax.pmean(l, axis_name='batch')
-    accuracy = jax.lax.pmean(accuracy, axis_name='batch')
     grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
 
-    return params, opt_state, l, new_rng, grad_norm, accuracy
+    return params, opt_state, l, new_rng, grad_norm
 
   return jax.pmap(update_fn, axis_name='batch', donate_argnums=(0,))
 
@@ -380,7 +369,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       input_pipeline.prefetch(ds_train, config.prefetch)):
 
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
-      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl, train_accuracy_repl = update_fn_repl(
+      params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl = update_fn_repl(
           params_repl, opt_state_repl, batch, update_rng_repl)
 
     for hook in hooks:
@@ -398,21 +387,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       lt0, lstep = time.time(), step
 
       train_loss = float(flax.jax_utils.unreplicate(loss_repl))
-      train_accuracy = float(flax.jax_utils.unreplicate(train_accuracy_repl))
       current_lr = float(lr_fn(step))
 
       writer.write_scalars(
           step,
           dict(
               train_loss=train_loss,
-              train_accuracy=train_accuracy,
               img_sec_core_train=img_sec_core_train))
 
       # W&B logging - train metrics
       if use_wandb:
         wandb.log({
             'Train/loss': train_loss,
-            'Train/accuracy': train_accuracy,
             'Train/learning_rate': current_lr,
             'Optim/lr': current_lr,
             'System/img_sec_core_train': img_sec_core_train,
@@ -422,7 +408,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       done = step / total_steps
       logging.info(f'Step: {step}/{total_steps} {100*done:.1f}%, '  # pylint: disable=logging-fstring-interpolation
                    f'Train loss: {train_loss:.4f}, '
-                   f'Train acc: {train_accuracy:.4f}, '
                    f'img/sec/core: {img_sec_core_train:.1f}, '
                    f'ETA: {(time.time()-t0)/done*(1-done)/3600:.2f}h')
 
@@ -469,6 +454,19 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       val_loss = np.mean(val_losses)
       top5_accuracy = compute_topk_accuracy(all_logits, all_labels, k=5)
 
+      # Compute train accuracy on a few batches to save memory
+      train_accuracies = []
+      num_train_batches = 5  # Sample 5 batches from training set
+      for i, train_batch in enumerate(input_pipeline.prefetch(ds_train, config.prefetch)):
+        if i >= num_train_batches:
+          break
+        train_logits = infer_fn_repl(dict(params=params_repl), train_batch['image'])
+        train_logits_flat = train_logits.reshape(-1, train_logits.shape[-1])
+        train_labels_flat = train_batch['label'].reshape(-1, train_batch['label'].shape[-1])
+        train_accuracies.append(
+            (np.argmax(train_logits_flat, axis=-1) == np.argmax(train_labels_flat, axis=-1)).mean())
+      train_accuracy = np.mean(train_accuracies) if train_accuracies else 0.0
+
       # Get class names from dataset info
       class_names = [dataset_info['int2str'](i) for i in range(dataset_info['num_classes'])]
 
@@ -483,19 +481,22 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       lr = float(lr_fn(step))
       logging.info(f'Step: {step} '  # pylint: disable=logging-fstring-interpolation
                    f'Learning rate: {lr:.7f}, '
-                   f'Test accuracy: {accuracy_test:0.5f}, '
+                   f'Train accuracy: {train_accuracy:0.5f}, '
+                   f'Val accuracy: {accuracy_test:0.5f}, '
                    f'Val loss: {val_loss:0.5f}, '
                    f'img/sec/core: {img_sec_core_test:.1f}')
       writer.write_scalars(
           step,
           dict(
+              train_accuracy=train_accuracy,
               accuracy_test=accuracy_test,
               lr=lr,
               img_sec_core_test=img_sec_core_test))
 
-      # W&B logging - Priority 1 validation metrics
+      # W&B logging - validation metrics
       if use_wandb:
         wandb_metrics = {
+            'Train/accuracy': train_accuracy,
             'Val/loss': val_loss,
             'Val/accuracy': accuracy_test,
             'Val/top1_accuracy': accuracy_test,
