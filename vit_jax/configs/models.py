@@ -56,6 +56,8 @@ def get_testing_config():
   config.transformer.dropout_rate = 0.1
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config
@@ -90,6 +92,8 @@ def get_ti16_config():
   config.transformer.dropout_rate = 0.0
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config
@@ -110,6 +114,8 @@ def get_s16_config():
   config.transformer.dropout_rate = 0.0
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config
@@ -130,6 +136,8 @@ def get_b16_config():
   config.transformer.dropout_rate = 0.0
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config
@@ -150,6 +158,8 @@ def get_l16_config():
   config.transformer.dropout_rate = 0.1
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config
@@ -170,6 +180,8 @@ def get_h14_config():
   config.transformer.dropout_rate = 0.1
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
+  config.transformer.use_headwise_gram_lowrank = False
+  config.transformer.headwise_gram_rank = 64
   config.classifier = 'token'
   config.representation_size = None
   return config

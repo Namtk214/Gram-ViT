@@ -318,12 +318,35 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     logging.warning('Config use_gram_lowrank_mhsa received as string, converted to: %s', use_gram_lowrank)
 
   if use_gram_lowrank:
-    gram_rank = getattr(config.model.transformer, 'gram_lowrank_rank', 8)
+    gram_rank = getattr(config.model.transformer, 'gram_lowrank_rank', 64)
     logging.info('✓ Gram-LowRank ENABLED: rank=%d', gram_rank)
   else:
     logging.info('✗ Gram-LowRank DISABLED (value was: %s, type: %s)',
                  getattr(config.model.transformer, 'use_gram_lowrank_mhsa', False),
                  type(getattr(config.model.transformer, 'use_gram_lowrank_mhsa', False)))
+
+  # Log Head-wise Gram-lowrank configuration
+  use_headwise_gram = getattr(config.model.transformer, 'use_headwise_gram_lowrank', False)
+
+  # Handle string "True"/"False" from command line
+  if isinstance(use_headwise_gram, str):
+    use_headwise_gram = use_headwise_gram.lower() in ('true', '1', 'yes')
+    logging.warning('Config use_headwise_gram_lowrank received as string, converted to: %s', use_headwise_gram)
+
+  if use_headwise_gram:
+    headwise_rank = getattr(config.model.transformer, 'headwise_gram_rank', 64)
+    num_heads = getattr(config.model.transformer, 'num_heads', 12)
+    logging.info('✓ HEAD-WISE Gram-LowRank ENABLED: rank=%d, num_heads=%d', headwise_rank, num_heads)
+    logging.info('  → Each of %d heads has its own A^(h) [N, %d] and B^(h) [%d, d_h] matrices',
+                 num_heads, headwise_rank, headwise_rank)
+  else:
+    logging.info('✗ HEAD-WISE Gram-LowRank DISABLED')
+
+  # Check for conflicting config
+  if use_gram_lowrank and use_headwise_gram:
+    logging.error('ERROR: Both use_gram_lowrank_mhsa and use_headwise_gram_lowrank are enabled!')
+    logging.error('You can only use one at a time. Please disable one of them.')
+    raise ValueError('Cannot enable both use_gram_lowrank_mhsa and use_headwise_gram_lowrank')
 
   # Check if we should load pretrained weights
   train_from_scratch = getattr(config, 'train_from_scratch', False)

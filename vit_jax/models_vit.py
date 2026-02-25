@@ -102,6 +102,100 @@ class MlpBlock(nn.Module):
     return output
 
 
+class HeadWiseGramLowRankBranch(nn.Module):
+  """Head-wise Gram Low-Rank Branch for MHSA output with RMSNorm.
+
+  Instead of using a single A, B pair for the entire hidden dimension D,
+  this module uses separate A^(h), B^(h) pairs for each attention head.
+
+  For each head h:
+    G_t^(h) = (X^(h) @ X^(h).T) / d_h  (token Gram matrix for head h)
+    T_g^(h) = G_t^(h) @ (A^(h) @ B^(h))  (correction for head h)
+
+  Then concatenate all T_g^(h) and add to MHSA output Z.
+
+  Attributes:
+    num_heads: Number of attention heads.
+    rank: Rank for low-rank matrices A and B (per head).
+    param_dtype: Data type for parameters.
+    eps: Epsilon for RMSNorm stability.
+  """
+
+  num_heads: int
+  rank: int = 64
+  param_dtype: Dtype = jnp.float32
+  eps: float = 1e-6
+
+  @nn.compact
+  def __call__(self, x_mhsa_in, z_mhsa_out):
+    """Apply Head-wise Gram + Low-Rank correction.
+
+    Args:
+      x_mhsa_in: Input to MHSA (after LayerNorm), shape [B, N, D].
+      z_mhsa_out: Output from MHSA, shape [B, N, D].
+
+    Returns:
+      Y = Z + RMSNorm(T_g), where T_g is the concatenated correction, shape [B, N, D].
+    """
+    # Get shapes
+    batch_size, num_tokens, hidden_dim = x_mhsa_in.shape
+    d_h = hidden_dim // self.num_heads  # dimension per head
+
+    # Step 1: Apply RMSNorm to X before computing Gram matrix
+    x_rms = jnp.sqrt(jnp.mean(x_mhsa_in ** 2, axis=-1, keepdims=True) + self.eps)
+    x_scale = self.param('X_scale', nn.initializers.ones, (1, 1, hidden_dim), self.param_dtype)
+    x_normed = (x_mhsa_in / x_rms) * x_scale
+
+    # Step 2: Reshape to [B, N, H, d_h] for head-wise processing
+    x_heads = x_normed.reshape(batch_size, num_tokens, self.num_heads, d_h)
+
+    # Step 3: Process each head separately
+    head_corrections = []
+    for h in range(self.num_heads):
+      # Get head h: [B, N, d_h]
+      x_h = x_heads[:, :, h, :]
+
+      # Compute token Gram matrix for head h: [B, N, N]
+      gram_h = jnp.matmul(x_h, jnp.transpose(x_h, (0, 2, 1))) / d_h
+
+      # Low-rank parameters for head h
+      # A^(h): [N, r], initialized with He/Kaiming uniform
+      # B^(h): [r, d_h], initialized with zeros (makes branch no-op initially)
+      a_matrix_h = self.param(
+          f'A_head_{h}',
+          nn.initializers.he_uniform(),
+          (num_tokens, self.rank),
+          self.param_dtype
+      )
+
+      b_matrix_h = self.param(
+          f'B_head_{h}',
+          nn.initializers.zeros,
+          (self.rank, d_h),
+          self.param_dtype
+      )
+
+      # Compute P^(h) = A^(h) @ B^(h), shape [N, d_h]
+      p_matrix_h = jnp.matmul(a_matrix_h, b_matrix_h)
+
+      # Compute correction term T_g^(h) = G_t^(h) @ P^(h), shape [B, N, d_h]
+      t_g_h = jnp.matmul(gram_h, p_matrix_h)
+
+      head_corrections.append(t_g_h)
+
+    # Step 4: Concatenate all head corrections along channel dimension
+    # Each t_g_h is [B, N, d_h], concat to get [B, N, D]
+    t_g = jnp.concatenate(head_corrections, axis=-1)
+
+    # Step 5: Apply RMSNorm to correction term T_g before adding to Z
+    t_rms = jnp.sqrt(jnp.mean(t_g ** 2, axis=-1, keepdims=True) + self.eps)
+    t_scale = self.param('T_scale', nn.initializers.ones, (1, 1, hidden_dim), self.param_dtype)
+    t_normed = (t_g / t_rms) * t_scale
+
+    # Step 6: Add normalized correction to MHSA output
+    return z_mhsa_out + t_normed
+
+
 class GramLowRankMHSAResidual(nn.Module):
   """Gram + Low-Rank residual correction for MHSA output with RMSNorm.
 
@@ -207,8 +301,10 @@ class Encoder1DBlock(nn.Module):
     attention_dropout_rate: dropout for attention heads.
     deterministic: bool, deterministic or not (to apply dropout).
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
-    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA.
-    gram_lowrank_rank: Rank for low-rank matrices in Gram residual.
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original).
+    gram_lowrank_rank: Rank for low-rank matrices in Gram residual (original).
+    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (new).
+    headwise_gram_rank: Rank for low-rank matrices in Head-wise Gram branch.
   """
 
   mlp_dim: int
@@ -216,9 +312,12 @@ class Encoder1DBlock(nn.Module):
   dtype: Dtype = jnp.float32
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
-  # bool = true
-  use_gram_lowrank_mhsa: bool = True
+  # Original Gram-lowrank (whole D)
+  use_gram_lowrank_mhsa: bool = False
   gram_lowrank_rank: int = 64
+  # New: Head-wise Gram-lowrank
+  use_headwise_gram_lowrank: bool = False
+  headwise_gram_rank: int = 64
 
   @nn.compact
   def __call__(self, inputs, *, deterministic):
@@ -235,6 +334,10 @@ class Encoder1DBlock(nn.Module):
     # Attention block.
     assert inputs.ndim == 3, f'Expected (batch, seq, hidden) got {inputs.shape}'
 
+    # Cannot use both Gram-lowrank variants simultaneously
+    assert not (self.use_gram_lowrank_mhsa and self.use_headwise_gram_lowrank), \
+        "Cannot enable both use_gram_lowrank_mhsa and use_headwise_gram_lowrank at the same time"
+
     # LayerNorm before MHSA
     x_mhsa_in = nn.LayerNorm(dtype=self.dtype)(inputs)
 
@@ -248,10 +351,18 @@ class Encoder1DBlock(nn.Module):
         num_heads=self.num_heads)(
             x_mhsa_in, x_mhsa_in)
 
-    # Apply Gram + Low-Rank residual if enabled
+    # Apply Gram + Low-Rank residual (original version - whole D)
     if self.use_gram_lowrank_mhsa:
       z_mhsa_out = GramLowRankMHSAResidual(
           rank=self.gram_lowrank_rank,
+          param_dtype=self.dtype)(
+              x_mhsa_in, z_mhsa_out)
+
+    # Apply Head-wise Gram + Low-Rank branch (new version - per head)
+    if self.use_headwise_gram_lowrank:
+      z_mhsa_out = HeadWiseGramLowRankBranch(
+          num_heads=self.num_heads,
+          rank=self.headwise_gram_rank,
           param_dtype=self.dtype)(
               x_mhsa_in, z_mhsa_out)
 
@@ -284,8 +395,10 @@ class Encoder(nn.Module):
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
     dropout_rate: dropout rate.
     attention_dropout_rate: dropout rate in self attention.
-    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA.
-    gram_lowrank_rank: Rank for low-rank matrices in Gram residual.
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original).
+    gram_lowrank_rank: Rank for low-rank matrices in Gram residual (original).
+    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (new).
+    headwise_gram_rank: Rank for low-rank matrices in Head-wise Gram branch.
   """
 
   num_layers: int
@@ -294,8 +407,12 @@ class Encoder(nn.Module):
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
   add_position_embedding: bool = True
-  use_gram_lowrank_mhsa: bool = True
+  # Original Gram-lowrank
+  use_gram_lowrank_mhsa: bool = False
   gram_lowrank_rank: int = 64
+  # New: Head-wise Gram-lowrank
+  use_headwise_gram_lowrank: bool = False
+  headwise_gram_rank: int = 64
 
   @nn.compact
   def __call__(self, x, *, train):
@@ -325,6 +442,8 @@ class Encoder(nn.Module):
           attention_dropout_rate=self.attention_dropout_rate,
           use_gram_lowrank_mhsa=self.use_gram_lowrank_mhsa,
           gram_lowrank_rank=self.gram_lowrank_rank,
+          use_headwise_gram_lowrank=self.use_headwise_gram_lowrank,
+          headwise_gram_rank=self.headwise_gram_rank,
           name=f'encoderblock_{lyr}',
           num_heads=self.num_heads)(
               x, deterministic=not train)
