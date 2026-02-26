@@ -422,14 +422,22 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
   lr_fn = utils.create_learning_rate_schedule(total_steps, config.base_lr,
                                               config.decay_type,
                                               config.warmup_steps)
+
+  # Use AdamW optimizer with weight decay for better regularization
+  weight_decay = getattr(config, 'weight_decay', 0.02)
   tx = optax.chain(
       optax.clip_by_global_norm(config.grad_norm_clip),
-      optax.sgd(
+      optax.adamw(
           learning_rate=lr_fn,
-          momentum=0.9,
-          accumulator_dtype='bfloat16',
+          b1=0.9,
+          b2=0.999,
+          eps=1e-8,
+          weight_decay=weight_decay,
       ),
   )
+
+  logging.info('Optimizer: AdamW (lr=%.4f, weight_decay=%.4f, betas=(0.9, 0.999))',
+               config.base_lr, weight_decay)
 
   update_fn_repl = make_update_fn(
       apply_fn=model.apply, accum_steps=config.accum_steps, tx=tx)

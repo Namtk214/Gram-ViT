@@ -39,6 +39,8 @@ def get_config():
 
   # Resizes global gradients.
   config.grad_norm_clip = 1.0
+  # Weight decay for AdamW optimizer (L2 regularization)
+  config.weight_decay = 0.02
   # Datatype to use for momentum state ("bfloat16" or "float32").
   config.optim_dtype = 'bfloat16'
   # Accumulate gradients over multiple steps to save on memory.

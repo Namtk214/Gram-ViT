@@ -53,7 +53,7 @@ def get_testing_config():
   config.transformer.num_heads = 2
   config.transformer.num_layers = 1
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.1
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
@@ -91,7 +91,7 @@ def get_ti16_config():
   config.transformer.num_heads = 3
   config.transformer.num_layers = 12
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.0
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
@@ -115,7 +115,7 @@ def get_s16_config():
   config.transformer.num_heads = 6
   config.transformer.num_layers = 12
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.0
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
@@ -139,7 +139,7 @@ def get_b16_config():
   config.transformer.num_heads = 12
   config.transformer.num_layers = 12
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.0
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
@@ -163,7 +163,7 @@ def get_l16_config():
   config.transformer.num_heads = 16
   config.transformer.num_layers = 24
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.1
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
@@ -187,7 +187,7 @@ def get_h14_config():
   config.transformer.num_heads = 16
   config.transformer.num_layers = 32
   config.transformer.attention_dropout_rate = 0.0
-  config.transformer.dropout_rate = 0.1
+  config.transformer.dropout_rate = 0.2
   config.transformer.use_gram_lowrank_mhsa = True
   config.transformer.gram_lowrank_rank = 64
   config.transformer.use_headwise_gram_lowrank = False
