@@ -196,6 +196,83 @@ class HeadWiseGramLowRankBranch(nn.Module):
     return z_mhsa_out + t_normed
 
 
+class StyleRepresentationBranch(nn.Module):
+  """Style Representation Branch using Channel Gram matrix with Low-Rank.
+
+  Uses channel Gram matrix S = X^T @ X / N (shape [B, d, d]) instead of token Gram.
+  Applies low-rank decomposition with matrices C and D to create style correction.
+
+  Formula:
+    S = (X^T @ X) / N                    (channel Gram, [B, d, d])
+    T_style = (S @ C @ D^T)^T            (style correction, [B, N, d])
+    output = RMSNorm(T_style)
+
+  Attributes:
+    rank: Rank for low-rank matrices C and D.
+    param_dtype: Data type for parameters.
+    eps: Epsilon for RMSNorm stability.
+  """
+
+  rank: int = 64
+  param_dtype: Dtype = jnp.float32
+  eps: float = 1e-6
+
+  @nn.compact
+  def __call__(self, x_for_gram):
+    """Apply Style Representation Branch with channel Gram.
+
+    Args:
+      x_for_gram: Input for computing Gram (typically x_ln after LayerNorm), shape [B, N, d].
+
+    Returns:
+      T_style after RMSNorm, shape [B, N, d].
+    """
+    # Get shapes
+    batch_size, num_tokens, hidden_dim = x_for_gram.shape
+
+    # Step 1: Compute channel Gram matrix S = X^T @ X / N
+    # X: [B, N, d], X^T: [B, d, N]
+    # S: [B, d, d]
+    channel_gram = jnp.matmul(
+        jnp.transpose(x_for_gram, (0, 2, 1)),  # [B, d, N]
+        x_for_gram                              # [B, N, d]
+    ) / num_tokens                              # [B, d, d]
+
+    # Step 2: Low-rank parameters for style branch
+    # C: [d, r_s], initialized with small normal (LoRA-style)
+    # D: [N, r_s], initialized with zeros (makes branch no-op initially)
+    c_matrix = self.param(
+        'C',
+        nn.initializers.normal(stddev=1e-2),
+        (hidden_dim, self.rank),
+        self.param_dtype
+    )
+
+    d_matrix = self.param(
+        'D',
+        nn.initializers.zeros,
+        (num_tokens, self.rank),
+        self.param_dtype
+    )
+
+    # Step 3: Compute style correction
+    # S @ C: [B, d, d] @ [d, r_s] -> [B, d, r_s]
+    sc = jnp.matmul(channel_gram, c_matrix)
+
+    # (S @ C) @ D^T: [B, d, r_s] @ [r_s, N] -> [B, d, N]
+    scd_t = jnp.matmul(sc, jnp.transpose(d_matrix, (1, 0)))
+
+    # Transpose to get T_style: [B, N, d]
+    t_style = jnp.transpose(scd_t, (0, 2, 1))
+
+    # Step 4: Apply RMSNorm to style correction
+    t_rms = jnp.sqrt(jnp.mean(t_style ** 2, axis=-1, keepdims=True) + self.eps)
+    t_scale = self.param('T_scale', nn.initializers.ones, (1, 1, hidden_dim), self.param_dtype)
+    t_style_normed = (t_style / t_rms) * t_scale
+
+    return t_style_normed
+
+
 class GramLowRankMHSAResidual(nn.Module):
   """Gram + Low-Rank residual correction for MHSA output with RMSNorm.
 
@@ -301,10 +378,12 @@ class Encoder1DBlock(nn.Module):
     attention_dropout_rate: dropout for attention heads.
     deterministic: bool, deterministic or not (to apply dropout).
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
-    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original).
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original, token Gram).
     gram_lowrank_rank: Rank for low-rank matrices in Gram residual (original).
-    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (new).
+    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (token Gram per head).
     headwise_gram_rank: Rank for low-rank matrices in Head-wise Gram branch.
+    use_style_branch: Enable Style Representation Branch (channel Gram).
+    style_rank: Rank for low-rank matrices in Style branch.
   """
 
   mlp_dim: int
@@ -318,6 +397,9 @@ class Encoder1DBlock(nn.Module):
   # New: Head-wise Gram-lowrank
   use_headwise_gram_lowrank: bool = False
   headwise_gram_rank: int = 64
+  # New: Style Representation Branch (Channel Gram)
+  use_style_branch: bool = False
+  style_rank: int = 64
 
   @nn.compact
   def __call__(self, inputs, *, deterministic):
@@ -352,21 +434,41 @@ class Encoder1DBlock(nn.Module):
             x_mhsa_in, x_mhsa_in)
 
     # Apply Gram + Low-Rank residual (original version - whole D)
+    # This gives us u = z + t_gram
+    u = z_mhsa_out
     if self.use_gram_lowrank_mhsa:
-      z_mhsa_out = GramLowRankMHSAResidual(
+      u = GramLowRankMHSAResidual(
           rank=self.gram_lowrank_rank,
           param_dtype=self.dtype)(
               x_mhsa_in, z_mhsa_out)
 
     # Apply Head-wise Gram + Low-Rank branch (new version - per head)
     if self.use_headwise_gram_lowrank:
-      z_mhsa_out = HeadWiseGramLowRankBranch(
+      u = HeadWiseGramLowRankBranch(
           num_heads=self.num_heads,
           rank=self.headwise_gram_rank,
           param_dtype=self.dtype)(
               x_mhsa_in, z_mhsa_out)
 
-    x = nn.Dropout(rate=self.dropout_rate)(z_mhsa_out, deterministic=deterministic)
+    # Apply LayerNorm on u (attention output after token Gram if enabled)
+    # This is the new LN required for style branch integration
+    u_bar = u
+    if self.use_style_branch:
+      u_bar = nn.LayerNorm(dtype=self.dtype)(u)
+
+      # Compute style correction using channel Gram
+      t_style = StyleRepresentationBranch(
+          rank=self.style_rank,
+          param_dtype=self.dtype)(
+              x_mhsa_in)
+
+      # Add style correction to normalized attention output
+      y = u_bar + t_style
+    else:
+      # No style branch, use u directly
+      y = u_bar
+
+    x = nn.Dropout(rate=self.dropout_rate)(y, deterministic=deterministic)
     x = x + inputs
 
     # MLP block.
@@ -395,10 +497,12 @@ class Encoder(nn.Module):
     num_heads: Number of heads in nn.MultiHeadDotProductAttention
     dropout_rate: dropout rate.
     attention_dropout_rate: dropout rate in self attention.
-    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original).
+    use_gram_lowrank_mhsa: Enable Gram + Low-Rank residual for MHSA (original, token Gram).
     gram_lowrank_rank: Rank for low-rank matrices in Gram residual (original).
-    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (new).
+    use_headwise_gram_lowrank: Enable Head-wise Gram Low-Rank branch (token Gram per head).
     headwise_gram_rank: Rank for low-rank matrices in Head-wise Gram branch.
+    use_style_branch: Enable Style Representation Branch (channel Gram).
+    style_rank: Rank for low-rank matrices in Style branch.
   """
 
   num_layers: int
@@ -407,12 +511,15 @@ class Encoder(nn.Module):
   dropout_rate: float = 0.1
   attention_dropout_rate: float = 0.1
   add_position_embedding: bool = True
-  # Original Gram-lowrank
+  # Original Gram-lowrank (token Gram)
   use_gram_lowrank_mhsa: bool = False
   gram_lowrank_rank: int = 64
-  # New: Head-wise Gram-lowrank
+  # New: Head-wise Gram-lowrank (token Gram per head)
   use_headwise_gram_lowrank: bool = False
   headwise_gram_rank: int = 64
+  # New: Style Representation Branch (channel Gram)
+  use_style_branch: bool = False
+  style_rank: int = 64
 
   @nn.compact
   def __call__(self, x, *, train):
@@ -444,6 +551,8 @@ class Encoder(nn.Module):
           gram_lowrank_rank=self.gram_lowrank_rank,
           use_headwise_gram_lowrank=self.use_headwise_gram_lowrank,
           headwise_gram_rank=self.headwise_gram_rank,
+          use_style_branch=self.use_style_branch,
+          style_rank=self.style_rank,
           name=f'encoderblock_{lyr}',
           num_heads=self.num_heads)(
               x, deterministic=not train)

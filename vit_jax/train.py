@@ -348,6 +348,23 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     logging.error('You can only use one at a time. Please disable one of them.')
     raise ValueError('Cannot enable both use_gram_lowrank_mhsa and use_headwise_gram_lowrank')
 
+  # Log Style Representation Branch configuration
+  use_style_branch = getattr(config.model.transformer, 'use_style_branch', False)
+
+  # Handle string "True"/"False" from command line
+  if isinstance(use_style_branch, str):
+    use_style_branch = use_style_branch.lower() in ('true', '1', 'yes')
+    logging.warning('Config use_style_branch received as string, converted to: %s', use_style_branch)
+
+  if use_style_branch:
+    style_rank = getattr(config.model.transformer, 'style_rank', 64)
+    logging.info('✓ STYLE Representation Branch ENABLED: rank=%d', style_rank)
+    logging.info('  → Uses Channel Gram matrix S = X^T @ X / N (shape [B, d, d])')
+    logging.info('  → Low-rank params: C [d, %d], D [N, %d]', style_rank, style_rank)
+    logging.info('  → Style correction: T_style = (S @ C @ D^T)^T with RMSNorm')
+  else:
+    logging.info('✗ STYLE Representation Branch DISABLED')
+
   # Check if we should load pretrained weights
   train_from_scratch = getattr(config, 'train_from_scratch', False)
 
