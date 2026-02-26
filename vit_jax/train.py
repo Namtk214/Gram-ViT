@@ -257,7 +257,8 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
     grad_metrics = jax.tree.map(
         lambda x: jax.lax.pmean(x, axis_name='batch'), grad_metrics)
 
-    updates, opt_state = tx.update(g, opt_state)
+    # Update params with optimizer (pass params for weight decay in AdamW)
+    updates, opt_state = tx.update(g, opt_state, params)
     params = optax.apply_updates(params, updates)
     l = jax.lax.pmean(l, axis_name='batch')
     grad_norm = jax.lax.pmean(grad_norm, axis_name='batch')
