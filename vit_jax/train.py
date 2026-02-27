@@ -198,7 +198,7 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
     # Compute gradient norm before updates
     grad_norm = tree_norm(g)
 
-    # Compute gradient metrics for important layers
+    # Compute gradient metrics for important layers (REDUCED to save memory)
     grad_metrics = {}
 
     # Extract gradient norms for Transformer layers
@@ -211,47 +211,47 @@ def make_update_fn(*, apply_fn, accum_steps, tx):
           block_idx = key.split('_')[1]
           block_grads = transformer_grads[key]
 
-          # Overall block gradient norm
+          # Overall block gradient norm (IMPORTANT - kept)
           block_grad_norm = tree_norm(block_grads)
           grad_metrics[f'block_{block_idx}_grad_norm'] = block_grad_norm
 
-          # MultiHeadDotProductAttention gradients
-          if 'MultiHeadDotProductAttention_0' in block_grads:
-            mhsa_grad_norm = tree_norm(block_grads['MultiHeadDotProductAttention_0'])
-            grad_metrics[f'block_{block_idx}_mhsa_grad_norm'] = mhsa_grad_norm
+          # # MultiHeadDotProductAttention gradients (COMMENTED to save memory)
+          # if 'MultiHeadDotProductAttention_0' in block_grads:
+          #   mhsa_grad_norm = tree_norm(block_grads['MultiHeadDotProductAttention_0'])
+          #   grad_metrics[f'block_{block_idx}_mhsa_grad_norm'] = mhsa_grad_norm
 
-          # MLP gradients
-          if 'MlpBlock_0' in block_grads:
-            mlp_grad_norm = tree_norm(block_grads['MlpBlock_0'])
-            grad_metrics[f'block_{block_idx}_mlp_grad_norm'] = mlp_grad_norm
+          # # MLP gradients (COMMENTED to save memory)
+          # if 'MlpBlock_0' in block_grads:
+          #   mlp_grad_norm = tree_norm(block_grads['MlpBlock_0'])
+          #   grad_metrics[f'block_{block_idx}_mlp_grad_norm'] = mlp_grad_norm
 
-          # GramLowRankMHSAResidual gradients (A and B matrices)
+          # GramLowRankMHSAResidual gradients (A and B matrices) - IMPORTANT
           if 'GramLowRankMHSAResidual_0' in block_grads:
             gram_grads = block_grads['GramLowRankMHSAResidual_0']
 
-            # Total Gram-lowrank gradient norm
-            gram_grad_norm = tree_norm(gram_grads)
-            grad_metrics[f'block_{block_idx}_gram_grad_norm'] = gram_grad_norm
+            # # Total Gram-lowrank gradient norm (COMMENTED to save memory)
+            # gram_grad_norm = tree_norm(gram_grads)
+            # grad_metrics[f'block_{block_idx}_gram_grad_norm'] = gram_grad_norm
 
-            # A matrix gradient norm
+            # A matrix gradient norm (IMPORTANT - kept)
             if 'A' in gram_grads:
               a_grad_norm = jnp.linalg.norm(gram_grads['A'])
               grad_metrics[f'block_{block_idx}_gram_A_grad_norm'] = a_grad_norm
 
-            # B matrix gradient norm
+            # B matrix gradient norm (IMPORTANT - kept)
             if 'B' in gram_grads:
               b_grad_norm = jnp.linalg.norm(gram_grads['B'])
               grad_metrics[f'block_{block_idx}_gram_B_grad_norm'] = b_grad_norm
 
-            # X_scale gradient norm
-            if 'X_scale' in gram_grads:
-              x_scale_grad_norm = jnp.linalg.norm(gram_grads['X_scale'])
-              grad_metrics[f'block_{block_idx}_gram_X_scale_grad_norm'] = x_scale_grad_norm
+            # # X_scale gradient norm (COMMENTED to save memory)
+            # if 'X_scale' in gram_grads:
+            #   x_scale_grad_norm = jnp.linalg.norm(gram_grads['X_scale'])
+            #   grad_metrics[f'block_{block_idx}_gram_X_scale_grad_norm'] = x_scale_grad_norm
 
-            # T_scale gradient norm
-            if 'T_scale' in gram_grads:
-              t_scale_grad_norm = jnp.linalg.norm(gram_grads['T_scale'])
-              grad_metrics[f'block_{block_idx}_gram_T_scale_grad_norm'] = t_scale_grad_norm
+            # # T_scale gradient norm (COMMENTED to save memory)
+            # if 'T_scale' in gram_grads:
+            #   t_scale_grad_norm = jnp.linalg.norm(gram_grads['T_scale'])
+            #   grad_metrics[f'block_{block_idx}_gram_T_scale_grad_norm'] = t_scale_grad_norm
 
     # Pmean all gradient metrics across devices
     grad_metrics = jax.tree.map(
@@ -476,9 +476,9 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
       range(initial_step, total_steps + 1),
       input_pipeline.prefetch(ds_train, config.prefetch)):
 
-    # Debug: Print input image statistics
-    imgs = batch['image']
-    print(f"[Step {step}] Input image - Shape: {imgs.shape}, Min: {float(jnp.min(imgs)):.4f}, Max: {float(jnp.max(imgs)):.4f}, Mean: {float(jnp.mean(imgs)):.4f}, Std: {float(jnp.std(imgs)):.4f}")
+    # Debug: Print input image statistics (DISABLED to save memory)
+    # imgs = batch['image']
+    # print(f"[Step {step}] Input image - Shape: {imgs.shape}, Min: {float(jnp.min(imgs)):.4f}, Max: {float(jnp.max(imgs)):.4f}, Mean: {float(jnp.mean(imgs)):.4f}, Std: {float(jnp.std(imgs)):.4f}")
 
     with jax.profiler.StepTraceAnnotation('train', step_num=step):
       params_repl, opt_state_repl, loss_repl, update_rng_repl, grad_norm_repl, grad_metrics_repl = update_fn_repl(
