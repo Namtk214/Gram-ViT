@@ -400,6 +400,9 @@ class Encoder1DBlock(nn.Module):
   # New: Style Representation Branch (Channel Gram)
   use_style_branch: bool = False
   style_rank: int = 64
+  # For selective activation logging (only first and last blocks)
+  block_idx: int = -1
+  num_layers: int = -1
 
   @nn.compact
   def __call__(self, inputs, *, deterministic):
@@ -480,10 +483,12 @@ class Encoder1DBlock(nn.Module):
     # Compute block output
     block_output = x + y
 
-    # Sow block output statistics (mean, abs_mean, std across all tokens and dimensions)
-    self.sow('intermediates', 'block_output_mean', jnp.mean(block_output))
-    self.sow('intermediates', 'block_output_abs_mean', jnp.mean(jnp.abs(block_output)))
-    self.sow('intermediates', 'block_output_std', jnp.std(block_output))
+    # Sow block output statistics ONLY for first and last blocks to save memory
+    if self.block_idx != -1 and self.num_layers != -1:
+      if self.block_idx == 0 or self.block_idx == self.num_layers - 1:
+        self.sow('intermediates', 'block_output_mean', jnp.mean(block_output))
+        self.sow('intermediates', 'block_output_abs_mean', jnp.mean(jnp.abs(block_output)))
+        self.sow('intermediates', 'block_output_std', jnp.std(block_output))
 
     return block_output
 
@@ -553,6 +558,8 @@ class Encoder(nn.Module):
           headwise_gram_rank=self.headwise_gram_rank,
           use_style_branch=self.use_style_branch,
           style_rank=self.style_rank,
+          block_idx=lyr,
+          num_layers=self.num_layers,
           name=f'encoderblock_{lyr}',
           num_heads=self.num_heads)(
               x, deterministic=not train)
